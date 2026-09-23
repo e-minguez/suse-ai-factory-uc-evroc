@@ -1,0 +1,23 @@
+# Every value here is a credential, and every one of them is jsonencode()d
+# rather than wrapped in bare double quotes: a double-quoted YAML scalar ends
+# at the first '"' and interprets backslash escapes, so a password with either
+# is a parse error or -- the worse case -- parses to a DIFFERENT string. That
+# one fails no build: the image is produced, the node boots, and the only
+# symptom is ImagePullBackOff on every AppCo/NGC image with a credential
+# nobody mistyped. A JSON string is always a valid YAML scalar. Same reasoning
+# as suse-storage.yaml.tftpl.
+credentials:
+  applicationCollection:
+    username: ${jsonencode(appco_username)}
+    password: ${jsonencode(appco_password)}
+  suseRegistry:
+    # The username for this registry is always the registration code itself.
+    username: ${jsonencode(suse_registration_code)}
+    password: ${jsonencode(suse_registry_password)}
+%{ if nvidia_api_key != null ~}
+  nvidia:
+    # NGC's own convention: the username is always the literal string
+    # "$oauthtoken", never a real account name.
+    username: "$oauthtoken"
+    password: ${jsonencode(nvidia_api_key)}
+%{ endif ~}

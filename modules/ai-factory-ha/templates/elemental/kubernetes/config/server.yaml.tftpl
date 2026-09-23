@@ -1,0 +1,20 @@
+# Flat RKE2 server config. No `server:` key here -- elemental derives the
+# join URL (https://<apiVIP>:9345) from network.apiVIP in cluster.yaml.
+token: ${token}
+selinux: true
+embedded-registry: false
+# Traefik has been a packaged chart since v1.35.0 and is the default from
+# v1.36; setting it explicitly makes the choice survive that flip in either
+# direction. The first value in the list becomes the default IngressClass.
+ingress-controller: ${ingress_controller}
+%{ if suse_storage_enabled ~}
+# suse-storage's values file sets defaultSettings.createDefaultDiskLabeledNodes
+# (kubernetes/helm/values/suse-storage.yaml.tftpl), so Longhorn creates a
+# default disk only on a node carrying this label. Servers only -- deliberate:
+# longhorn-manager/-csi-plugin still run on every node that MOUNTS a volume
+# (including GPU workers), but no replica data or replica I/O lands anywhere
+# but here. Applied at node registration, so it lands on a fresh build and not
+# retroactively.
+node-label:
+  - "node.longhorn.io/create-default-disk=true"
+%{ endif ~}

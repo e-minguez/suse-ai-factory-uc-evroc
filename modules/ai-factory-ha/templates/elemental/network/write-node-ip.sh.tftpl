@@ -1,0 +1,122 @@
+#!/usr/bin/env bash
+# write-node-ip.service (see butane.yaml.tftpl), a oneshot firstboot unit that
+# writes /etc/rancher/rke2/config.yaml.d/99-node-ip.yaml -- but only on a node
+# that turns out to have more than one physical NIC.
+#
+# RKE2 defaults node-ip to the default route's source address. evroc VMs are
+# expected to carry exactly ONE NIC (see configure-network.sh.tftpl's
+# header), so on every node this module builds today that default is already
+# the right -- and only -- address, and writing this file would be actively
+# harmful: it would freeze node-ip at whatever address this script found,
+# on a node where RKE2's own, always-correct default needs no help at all.
+#
+# WHAT DECIDES WHICH KIND OF NODE THIS IS.
+#
+# The count of physical NICs in /sys/class/net, read locally, always
+# available, and true the moment this unit runs -- exactly the same count
+# configure-network.sh.tftpl takes as its own shape signal, so the two
+# scripts never disagree about a given node.
+#
+# The multi-NIC branch below is not exercised by anything this module builds
+# today; it exists so a future node shape with more than one interface does
+# not silently inherit a wrong node-ip. This script renders with no template
+# variables at all (it is indent()ed into butane.yaml.tftpl as a literal), so
+# it has no VPC range handed to it to check against -- it picks the private
+# (RFC1918) address among the node's interfaces as a stand-in for "the one
+# that faces the cluster network". An address is validated as a dotted quad
+# before it is used anywhere: writing a non-IP value here makes rke2-server
+# exit 1 with "invalid node-ip: invalid ip format '...'" and never start --
+# on every control plane at once.
+#
+# This runs in the REAL root, ordered by butane.yaml.tftpl's unit to run
+# before rke2-server/rke2-agent/k8s-config-installer -- unlike
+# configure-network.sh, which runs under catalyst-net-initrd-script.service's
+# sandbox (read-only except /proc, /sys, /dev) and could never write here at
+# all.
+set -euo pipefail
+
+CONFIG_DIR="/etc/rancher/rke2/config.yaml.d"
+CONFIG_FILE="$CONFIG_DIR/99-node-ip.yaml"
+
+log() {
+  echo "[write-node-ip] $*"
+}
+
+die() {
+  log "ERROR: $*"
+  exit 1
+}
+
+# A dotted quad with every octet in range. Guards against a garbage value and
+# against an empty body.
+is_ipv4() {
+  local candidate=$1 octet
+  [[ $candidate =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]] || return 1
+  # Split on dots without tr/cut: set the field separator for one read.
+  local IFS=.
+  for octet in $candidate; do
+    # Strips any leading zeros before the comparison, and rejects "" safely.
+    [ "$((10#$octet))" -le 255 ] || return 1
+  done
+  return 0
+}
+
+# RFC1918: 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16. Used only as a stand-in
+# for "the cluster-facing interface" on the untested multi-NIC path below --
+# see the header note on why there is no template-supplied range to check
+# against instead.
+is_private_ipv4() {
+  local candidate=$1 a b
+  is_ipv4 "$candidate" || return 1
+  local IFS=.
+  set -- $candidate
+  a=$1
+  b=$2
+  [ "$a" = "10" ] && return 0
+  [ "$a" = "192" ] && [ "$b" = "168" ] && return 0
+  if [ "$a" = "172" ] && [ "$b" -ge 16 ] && [ "$b" -le 31 ]; then
+    return 0
+  fi
+  return 1
+}
+
+physical_ifaces=()
+for sys_path in /sys/class/net/*/device; do
+  [ -e "$sys_path" ] || continue
+  ifname=$${sys_path%/device}
+  ifname=$${ifname##*/}
+  physical_ifaces+=("$ifname")
+done
+log "found $${#physical_ifaces[@]} physical NIC(s) via /sys/class/net: $${physical_ifaces[*]:-none}"
+
+if [ "$${#physical_ifaces[@]}" -le 1 ]; then
+  log "single NIC (or none): RKE2's own default node-ip is already correct, writing nothing"
+  exit 0
+fi
+
+# Multi-NIC from here on -- not exercised by anything this module builds
+# today. Walk each physical interface's global IPv4 addresses looking for one
+# in a private range.
+vpc_address=""
+for ifname in "$${physical_ifaces[@]}"; do
+  while read -r line; do
+    rest=$${line#*inet }
+    [ "$rest" = "$line" ] && continue
+    candidate=$${rest%% *}
+    candidate=$${candidate%%/*}
+    if is_private_ipv4 "$candidate"; then
+      vpc_address=$candidate
+      log "interface $ifname address $candidate looks private -- using it as node-ip"
+      break
+    fi
+  done < <(ip -4 -o addr show dev "$ifname" scope global 2>/dev/null)
+  [ -n "$vpc_address" ] && break
+done
+
+if [ -z "$vpc_address" ] || ! is_ipv4 "$vpc_address"; then
+  die "no interface with a private IPv4 address found among: $${physical_ifaces[*]}"
+fi
+
+mkdir -p "$CONFIG_DIR"
+printf 'node-ip: %s\n' "$vpc_address" > "$CONFIG_FILE"
+log "wrote $CONFIG_FILE: node-ip: $vpc_address"

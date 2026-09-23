@@ -1,0 +1,84 @@
+# --------------------------------------------------------------------------
+# Secrets. Everything in this block is here because it has held, or will
+# hold, a live credential for this project: the evroc context or service
+# account key, root's password hash, SSH private keys, SUSE Application
+# Collection and registry credentials, the NVIDIA NGC key, or the RKE2 join
+# token.
+# --------------------------------------------------------------------------
+
+# Real variable files. terraform.tfvars here carries every credential the
+# module takes; the .example files carry REPLACE_WITH_* placeholders only.
+*.tfvars
+*.tfvars.json
+!*.tfvars.example
+!*.tfvars.json.example
+
+# Written by examples/ha-cluster/deploy.sh's second pass; holds the
+# image-ready flag, not secrets, but is generated and per-deployment.
+*.auto.tfvars.json
+
+# State. Terraform writes every sensitive input to state IN PLAINTEXT --
+# for this module that includes root_password_hash, ssh_authorized_keys,
+# the appco/SUSE/NVIDIA credentials and random_password.token. A committed
+# state file leaks all of them at once, so match it broadly rather than by
+# exact filename.
+*.tfstate
+*.tfstate.*
+.terraform.tfstate.lock.info
+
+# Saved plans are as sensitive as state -- a plan file embeds the resolved
+# values of every attribute it intends to write.
+*.tfplan
+*.tfplan.*
+
+# Provider credentials and local CLI config.
+.terraformrc
+terraform.rc
+.env
+.envrc
+
+# evroc CLI context. `evroc login` writes credentials, project and region
+# here; the provider reads it with no further configuration, which is
+# exactly why a stray copy inside the repo is dangerous.
+.evroc/
+evroc-config.yaml
+
+# Private keys and fetched kubeconfigs. rke2.yaml embeds a cluster-admin
+# client certificate.
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa*
+id_ed25519*
+kubeconfig
+kubeconfig*
+*.kubeconfig
+
+# --------------------------------------------------------------------------
+# Working files and artefacts.
+# --------------------------------------------------------------------------
+
+.terraform/
+crash.log
+crash.*.log
+
+# Built elemental images. The raw is ~8-35 GB and the build normally runs
+# on the jumphost, but a local `elemental customize` drops one right here.
+# It also contains the RKE2 join token and root's password hash.
+*.raw
+*.iso
+*.qcow2
+
+# Lock files: modules are consumed by callers who resolve their own
+# providers, so the module's lock file is noise. Examples are root
+# modules; their lock file is committed for reproducible applies.
+modules/**/.terraform.lock.hcl
+
+# Editor, tooling and OS noise.
+.claude/
+.DS_Store
+*.swp
+*~
+*.bak
+*.orig

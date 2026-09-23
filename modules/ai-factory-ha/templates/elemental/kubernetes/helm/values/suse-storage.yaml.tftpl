@@ -1,0 +1,41 @@
+# The chart resolves image registries as
+# coalesce(global.imageRegistry, registry_url, image.<x>.registry) and
+# registry_url is never empty -- it falls back to docker.io -- so the
+# per-image dp.apps.rancher.io defaults never win. registryUrl below is
+# what actually points the images at Application Collection.
+privateRegistry:
+  createSecret: true
+  registryUrl: dp.apps.rancher.io
+  # jsonencode(), not bare interpolation: an appco password containing ":" or
+  # "#" is a YAML parse error otherwise -- same reasoning as
+  # butane.yaml.tftpl:22's root_password_hash.
+  registryUser: ${jsonencode(appco_username)}
+  registryPasswd: ${jsonencode(appco_password)}
+  registrySecret: application-collection
+%{ if node_count < 3 ~}
+
+# Replicas can't share a node, so the chart default of 3 would leave every
+# volume Degraded on a small cluster. 3+ nodes keep the chart default.
+persistence:
+  defaultClassReplicaCount: ${node_count}
+%{ endif ~}
+# createDefaultDiskLabeledNodes is always on: Longhorn then creates a default
+# disk only on a node carrying node.longhorn.io/create-default-disk=true, which
+# kubernetes/config/server.yaml.tftpl applies to control-plane nodes only --
+# see that template's comment for why replica storage is kept off GPU nodes.
+# Merged into ONE defaultSettings mapping with the conditional replica-count
+# keys below, rather than a second defaultSettings: block inside the node
+# count check: a duplicate top-level YAML key silently drops one of the two
+# instead of merging.
+defaultSettings:
+  createDefaultDiskLabeledNodes: true
+%{ if node_count < 3 ~}
+  # control_plane_count (variables.tf) is validated >= 3 && odd, so this
+  # branch is unreachable in this module today and renders nothing. Kept
+  # anyway: it is the correct guard the moment a single-server or
+  # worker-storage variant appears, and Longhorn's default replica count of 3
+  # would otherwise leave every volume Degraded there.
+  defaultReplicaCount:
+    v1: "${node_count}"
+    v2: "${node_count}"
+%{ endif ~}

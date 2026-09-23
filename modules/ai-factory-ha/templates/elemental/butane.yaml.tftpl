@@ -1,0 +1,257 @@
+# Everything that is identical on every node in the cluster.
+#
+# elemental3 customize transpiles this file into the initrd CPIO extension as
+# /usr/lib/ignition/base.d/90-butane.ign, beside its own 10-elemental.ign.
+# Ignition merges every base.d config in lexical order, then merges the
+# *platform* config -- on evroc, the instance's cloud-init user data -- on top.
+# So the two paths are LAYERED, not exclusive: this file carries the
+# cluster-wide half, user_data carries only what differs per node.
+#
+# Before editing: this file is in local.elemental_files, which is hashed into
+# time_static.build's triggers, so changing one SSH key rebuilds the image and
+# replaces every node (~30 min). Accepted deliberately to keep the common
+# configuration in one place.
+variant: fcos
+version: 1.6.0
+
+passwd:
+  users:
+    - name: root
+      # jsonencode(), not a bare interpolation: a crypt hash is full of "$"
+      # and YAML has opinions. A JSON string is always a valid YAML scalar.
+      password_hash: ${jsonencode(root_password_hash)}
+%{ if permit_root_ssh ~}
+      # Only when permit_root_ssh is on. There is no point giving root keys
+      # sshd is configured to refuse, and leaving them off means "is root
+      # reachable over SSH" has exactly one answer in one place rather than
+      # two settings that can disagree.
+      ssh_authorized_keys:
+%{ for key in ssh_authorized_keys ~}
+        - ${jsonencode(key)}
+%{ endfor ~}
+%{ endif ~}
+    # The account SSH is actually meant to land on. Escalation is `su -` with
+    # the root password: sudo is NOT installed in this image -- no binary, no
+    # wheel group, no sudoers rules -- so the
+    # jumphost's cloud-init "sudo: ALL=(ALL) NOPASSWD:ALL" pattern has nothing
+    # to hook into here.
+    - name: ${jsonencode(node_username)}
+      password_hash: ${jsonencode(node_user_password_hash)}
+      # The image's default shell for a new user is not pinned anywhere; name
+      # it, so `su - ${node_username}` lands somewhere usable.
+      shell: /bin/bash
+      ssh_authorized_keys:
+%{ for key in ssh_authorized_keys ~}
+        - ${jsonencode(key)}
+%{ endfor ~}
+
+systemd:
+  units:
+    # Not enabled by default in the elemental OS image.
+    - name: sshd.service
+      enabled: true
+    # Runs write-node-ip.sh, which on the single-NIC node this module builds
+    # today writes nothing at all -- RKE2's own default node-ip is already
+    # correct -- and only writes 99-node-ip.yaml if this node ever turns out
+    # to have more than one physical NIC. See
+    # templates/elemental/network/write-node-ip.sh.tftpl's header for the full
+    # reasoning: why it must run here, in the real root, rather than in
+    # configure-network.sh's read-only initrd sandbox; why the script needs no
+    # template-supplied conditional to pick which case it is in (it detects
+    # the NIC count itself, from /sys); why Before= is ordering only and not a
+    # hard dependency.
+    #
+    # Before= deliberately does not become a hard failure if the script dies:
+    # a node with the wrong (or missing) node-ip is degraded and shows up in
+    # `systemctl --failed`, but a node that refuses to boot over a network
+    # script's exit code is worse.
+    - name: write-node-ip.service
+      enabled: true
+      contents: |
+        [Unit]
+        Description=Write RKE2 node-ip override, if this node has more than one NIC
+        Wants=network-online.target
+        After=network-online.target
+        Before=rke2-server.service rke2-agent.service k8s-config-installer.service
+
+        [Service]
+        Type=oneshot
+        RemainAfterExit=yes
+        # Run THROUGH bash, rather than executing the script directly.
+        # SELinux is Enforcing on this image and everything Ignition writes
+        # under /var/lib/elemental is labelled var_lib_t, which init_t may not
+        # execute -- systemd fails with 203/EXEC, "Unable to locate executable
+        # ... Permission denied", and no AVC in dmesg because the denial is
+        # dontaudited. There is nowhere to move the file to fix that: a path
+        # labelled bin_t is inside the read-only image, and anything writable
+        # at Ignition time is var_lib_t or etc_t. Naming the interpreter makes
+        # the script an argument that bash READS -- a plain read of var_lib_t,
+        # which is allowed -- instead of a target of execve. A direct
+        # ExecStart of the script fails 203/EXEC; `bash <path>` returns 0.
+        ExecStart=/usr/bin/bash /var/lib/elemental/write-node-ip.sh
+
+        [Install]
+        WantedBy=multi-user.target
+%{ if enable_iscsi_prep ~}
+    # Only on an image whose components pull the suse-storage extension in.
+    # The extension delivers open-iSCSI under /usr and nothing under /etc --
+    # which is everything it needs to actually run. See the script's header for
+    # the full diagnosis; short version: without this, a Longhorn PVC binds,
+    # replicas schedule, and the consuming pod hangs in ContainerCreating with
+    # AttachVolume.Attach ... DeadlineExceeded.
+    - name: iscsi-prep.service
+      enabled: true
+      contents: |
+        [Unit]
+        Description=Seed /etc for the sysext-delivered open-iSCSI and start iscsid
+        # The extension is merged by systemd-sysext; the script also waits for
+        # /usr/sbin/iscsid itself, because ordering after that unit does not
+        # guarantee the merge on every boot path.
+        Wants=systemd-sysext.service
+        After=systemd-sysext.service local-fs.target
+        # Deliberately NO Before=iscsid.service: the script starts iscsid, and
+        # ordering ahead of it would deadlock that start job against this unit.
+        ConditionPathExists=/var/lib/elemental/iscsi-prep.sh
+
+        [Service]
+        Type=oneshot
+        RemainAfterExit=yes
+        # Through bash, for the same SELinux reason as write-node-ip.service
+        # above -- var_lib_t is readable but not executable by init_t.
+        ExecStart=/usr/bin/bash /var/lib/elemental/iscsi-prep.sh
+
+        [Install]
+        WantedBy=multi-user.target
+%{ endif ~}
+%{ if enable_local_path_prep ~}
+    # local-path-provisioner stores every PVC under /opt/local-path-provisioner
+    # and does not create that directory itself: its helper pod runs a plain
+    # `mkdir` inside a container and fails with "Permission denied" if the path
+    # is missing or wrongly labelled, leaving the PVC Pending for ever.
+    #
+    # It cannot be an Ignition storage.directories entry. Ignition runs in the
+    # initrd against /sysroot, where /opt belongs to the read-only image, and a
+    # failed write there does not warn -- it fails the whole files stage and
+    # drops the node in the dracut emergency shell (see the write-node-ip.sh
+    # path note further down). /opt IS writable once the real root is up, so
+    # the work moves to a boot-time unit.
+    #
+    # -Z is the entire point and not a precaution. Without it the new directory
+    # inherits usr_t from /opt, which a container may not write. With it,
+    # mkdir asks the loaded policy for the path's default label -- and
+    # rke2-selinux ships a file-context rule putting /opt/local-path-provisioner
+    # at container_file_t, which is exactly what the helper pod needs.
+    - name: local-path-prep.service
+      enabled: true
+      contents: |
+        [Unit]
+        Description=Create the local-path-provisioner data directory with a container-writable SELinux label
+        After=local-fs.target
+        # Ordering only, like write-node-ip.service: a node that cannot make
+        # one directory should still boot and still join the cluster.
+        Before=rke2-server.service rke2-agent.service
+
+        [Service]
+        Type=oneshot
+        RemainAfterExit=yes
+        ExecStart=/usr/bin/mkdir -pZ /opt/local-path-provisioner
+        # Self-heal a directory that already exists with the wrong label --
+        # mkdir -p leaves an existing path alone, including its context.
+        # Prefixed with "-" so a policycoreutils-less image is not a boot
+        # failure: the mkdir above is what matters on a fresh node.
+        ExecStart=-/usr/sbin/restorecon -R /opt/local-path-provisioner
+
+        [Install]
+        WantedBy=multi-user.target
+%{ endif ~}
+
+storage:
+  # /home is NOT part of the root filesystem on this image: it is a separate
+  # btrfs subvolume, @/home on the SYSTEM partition (vda4), mounted at runtime
+  # (`findmnt /home` shows /dev/vda4[/@/home], and the mountpoint is
+  # home_root_t). In the initrd,
+  # where Ignition runs, it is NOT mounted, so without this block useradd
+  # would create /home/${node_username} on the root filesystem and Ignition
+  # would write the SSH key into it -- and then the real subvolume would mount
+  # over the top at boot, leaving an account with no home directory and no key.
+  # Declaring the filesystem with a `path` makes Ignition mount it for the
+  # duration of the disks/files/users stages.
+  #
+  # wipe_filesystem: false is load-bearing. This is the partition the OS lives
+  # on; the default (false) is relied on rather than assumed, in writing.
+  filesystems:
+    - device: /dev/disk/by-partlabel/SYSTEM
+      format: btrfs
+      wipe_filesystem: false
+      path: /home
+      mount_options:
+        - subvol=/@/home
+
+  files:
+    # sshd defaults to PermitRootLogin prohibit-password, which rejects a
+    # password login for root even once the hash above is set. This file
+    # decides root's SSH access outright, in both directions.
+    - path: /etc/ssh/sshd_config.d/sshd.conf
+      # Decimal on purpose: elemental unmarshals this file into a
+      # map[string]any and re-marshals it before butane sees it, so a
+      # leading-zero octal literal has to survive two YAML round trips.
+      mode: 384 # 0600
+      overwrite: true
+      contents:
+        inline: |
+          PermitRootLogin ${permit_root_ssh ? "yes" : "no"}
+          # Stated rather than inherited. Ignition has written keys to
+          # ~/.ssh/authorized_keys in some versions and to
+          # ~/.ssh/authorized_keys.d/ignition in others, and which one this
+          # image's Ignition uses is not something to discover through a
+          # 30-minute rebuild and a locked-out node. Listing both is a
+          # superset: sshd skips an entry that does not exist.
+          AuthorizedKeysFile .ssh/authorized_keys .ssh/authorized_keys.d/ignition
+    - path: /root/.profile
+      mode: 416 # 0640
+      # The image ships one; Ignition fails on an existing path unless told.
+      overwrite: true
+      contents:
+        inline: |
+          export KUBECONFIG=/etc/rancher/rke2/rke2.yaml
+          export PATH=$${PATH}:/var/lib/rancher/rke2/bin
+          alias k=/var/lib/rancher/rke2/bin/kubectl
+    # Backing script for write-node-ip.service above. Rendered and indent()ed
+    # in locals.tf so the shell script lives in its own file rather than
+    # being hand-inlined into this YAML.
+    #
+    # NOT /opt, and not anywhere else under the image's own tree: on this
+    # read-only rootfs Ignition cannot create a file there, and it does not
+    # skip it or warn -- it fails the whole files stage, which takes
+    # ignition-files.service, initrd-fs.target and the boot with it. The node
+    # lands in the dracut emergency shell with "failed to create file
+    # \"/sysroot/opt/write-node-ip.sh\": ... read-only file system", which
+    # reads like a disk fault rather than a path choice.
+    #
+    # /var/lib/elemental is the safe choice and not an arbitrary one: it is
+    # already written during this same Ignition stage, both by this module
+    # (runtime.env, per node, from user_data) and by elemental itself
+    # (kubernetes/**, from base.d), so it is proven writable here on this exact
+    # image. /etc would work too; /var keeps a generated script out of the
+    # admin-config tree.
+    #
+    # The 0755 here is for anyone running it by hand; it is NOT what lets the
+    # unit start it. SELinux forbids executing a var_lib_t file regardless of
+    # the mode bits, which is why the unit invokes bash explicitly -- see the
+    # comment on ExecStart above.
+    - path: /var/lib/elemental/write-node-ip.sh
+      mode: 493 # 0755
+      overwrite: true
+      contents:
+        inline: |
+          ${indent(10, write_node_ip_script)}
+%{ if enable_iscsi_prep ~}
+    # Backing script for iscsi-prep.service above. Same /var/lib/elemental
+    # placement, and the same reasons, as write-node-ip.sh.
+    - path: /var/lib/elemental/iscsi-prep.sh
+      mode: 493 # 0755
+      overwrite: true
+      contents:
+        inline: |
+          ${indent(10, iscsi_prep_script)}
+%{ endif ~}

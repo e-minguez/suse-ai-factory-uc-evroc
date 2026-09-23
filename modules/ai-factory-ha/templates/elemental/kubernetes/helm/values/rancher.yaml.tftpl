@@ -1,0 +1,12 @@
+# The release manifest bakes in replicas/postDelete/global.* for the rancher
+# chart already -- this file only supplies what it doesn't: a hostname for
+# Rancher's ingress, and the initial admin bootstrap password.
+#
+# jsonencode(), not bare double quotes: a double-quoted YAML scalar ends
+# at the first '"' and processes backslash escapes, so an operator-supplied
+# rancher_bootstrap_password containing either is silently mangled or fails the
+# parse. (The generated fallback is safe -- random_password sets special =
+# false -- but var.rancher_bootstrap_password is unconstrained.) Same reasoning
+# as suse-storage.yaml.tftpl.
+hostname: ${jsonencode(hostname)}
+bootstrapPassword: ${jsonencode(bootstrap_password)}

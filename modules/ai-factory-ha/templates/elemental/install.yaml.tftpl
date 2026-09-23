@@ -1,0 +1,75 @@
+schema: v0
+
+bootloader: grub
+
+# ignition.platform.id names a config-DELIVERY CONVENTION, not the hypervisor.
+# evroc runs KubeVirt -- the guest's own DMI string says `KubeVirt None` -- and
+# `kubevirt` is nevertheless the wrong value here. Do not "correct" this back.
+#
+# What evroc actually presents is a 1 MB drive labelled `cidata` holding
+# `user-data` and `meta-data`: a standard cloud-init NoCloud drive, built by
+# evroc themselves rather than rendered by KubeVirt. Ignition's providers were
+# run by hand against that exact drive (Ignition 2.21.0, the binary shipped in
+# this image at /usr/lib/dracut/modules.d/30ignition/ignition):
+#
+#   --platform=kubevirt   waits on /dev/disk/by-label/config-2 -- ConfigDrive,
+#                         a label a NoCloud drive does not carry -- in an
+#                         UNBOUNDED retry loop, logging `config drive ... not
+#                         found. Waiting...` forever. Nothing times out and
+#                         nothing fails, so the node hangs in Ignition
+#                         (fetch-offline) for good and never reaches sshd.
+#                         This is what this module set at first, and why.
+#   --platform=proxmoxve  mounts /dev/disk/by-label/cidata and reads `user-data`.
+#                         Proxmox generates the same standard NoCloud drive, so
+#                         its provider is the one whose convention matches.
+#
+# The one thing proxmoxve refuses is a `user-data` beginning with the
+# `#cloud-config` header, which it logs as `contains a cloud-config
+# configuration, ignoring`. What this module puts there is Ignition JSON, so
+# that branch is not taken -- but it is why cloud-init-style user data cannot be
+# mixed in on the nodes.
+#
+# None of this replaces elemental's base.d drop-ins, which the Ignition engine
+# reads on every platform -- see butane.yaml.tftpl's header for how the two
+# layer.
+#
+# Nodes that behave as if base.d were empty (Ignition logging `no config dir at
+# "/usr/lib/ignition/base.d"` at every stage) are NOT hitting this setting --
+# the platform id only decides where the PER-NODE config comes from, and a node
+# showing that line has usually fetched its per-node config perfectly well.
+# That is the customize/installer version skew: the CPIO carrying base.d is
+# attached via bootloader.initrdExtensions, which a 3.0.x elemental3ctl in the
+# OS IMAGE ignores, so it reaches the installer's initrd and never the
+# installed system's. It takes elemental's own Kubernetes bring-up with it, not
+# just our butane layer. var.core_platform_override is the cure and now
+# defaults to an OS image on the beta 16.1 line; see PLATFORM-NOTES.md,
+# "base.d goes missing when the OS image's elemental3ctl is too old".
+#
+# console=ttyS0, not some other serial line: evroc is a KVM-class hypervisor,
+# where ttyS0 is wired to a real TTY the way a plain KVM guest expects it to
+# be -- there is no hypervisor-side remapping to work around here.
+#
+# There is deliberately no `quiet`. It was here originally and was removed: on
+# evroc a node that fails to boot is otherwise completely silent, because the
+# platform has no serial console and no VNC (see PLATFORM-NOTES.md). Boot
+# output is only available as console logs retrieved by evroc support on
+# request, and with `quiet` set those show nothing useful. The cost of leaving
+# it off is a noisier boot; the cost of putting it back is that the next
+# failure is undiagnosable.
+kernelCmdLine: "console=ttyS0 console=tty0 ignition.platform.id=proxmoxve"
+%{ if fips ~}
+
+# Every node in the cluster must be FIPS-ready once this is set -- var.fips
+# defaults to false because that is not a call to make silently.
+cryptoPolicy: fips
+%{ endif ~}
+
+# This image is EFI-only: elemental3's grub install here targets the EFI
+# System Partition and writes nothing a BIOS boot path could use. On evroc
+# the VM must carry the user label
+# compute-experimental-features-UEFI = "true", or the platform boots it BIOS
+# instead -- and the EFI-only GRUB this image ships is simply not there. The
+# node does not fail to boot into the wrong bootloader; it fails to find a
+# bootloader at all.
+raw:
+  diskSize: ${disk_size}

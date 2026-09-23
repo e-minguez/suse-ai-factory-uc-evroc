@@ -1,0 +1,549 @@
+#!/usr/bin/env bash
+# Rendered into the jumphost's user_data by cloud-init and run under
+# nohup/setsid (see cloud-init.yaml.tftpl) so a build that takes tens of
+# minutes never blocks cloud-init itself. Builds the elemental raw image with
+# podman, then dd's it directly onto the blank disk evroc attached for this
+# purpose (image-build.tf's evroc_hotswap_disk_attachment.image_target).
+# There is no import-from-URL step here: evroc has no such API, so the
+# imported artifact IS the disk, snapshotted afterwards by snapshot.tf.
+set -euo pipefail
+
+exec >> "${log_file}" 2>&1
+
+# Logging goes to a DEDICATED descriptor, not to stdout, and that is
+# load-bearing rather than stylistic. Functions here return a value the only
+# way a shell function can -- by printing it and being called in a command
+# substitution -- and `$(...)` captures stdout at the point of the call,
+# BEFORE the redirect on line 11 ever applies. A log() that echoed to stdout
+# would therefore have its output swallowed into the caller's variable:
+# resolve_target_disk would hand back three log lines with the device path
+# glued on the end, and dd would fail trying to open that whole blob as a
+# filename. fd 3 is immune to both `$(...)` and any `2>&1` a caller adds.
+exec 3>> "${log_file}"
+
+log() {
+  echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $*" >&3
+}
+
+log "=== image-factory starting ==="
+
+RAW_IMAGE=""
+SENTINEL_DIR="/var/lib/image-factory"
+SENTINEL="$SENTINEL_DIR/done"
+
+# Removes the raw (several GB, and useless once it is on the target disk) on
+# every exit path, logs a final status, and makes sure a failed run never
+# leaves a stale sentinel behind for wait-for-image.sh to mistake for success.
+cleanup() {
+  status=$?
+  if [ -n "$RAW_IMAGE" ] && [ -f "$RAW_IMAGE" ]; then
+    log "cleanup: removing $RAW_IMAGE"
+    rm -f "$RAW_IMAGE"
+  fi
+  if [ "$status" -ne 0 ]; then
+    log "cleanup: build failed (exit $status) -- removing sentinel if present"
+    rm -f "$SENTINEL"
+  fi
+  log "=== image-factory exiting with status $status ==="
+  exit $status
+}
+trap cleanup EXIT
+
+log "step 1/9: refreshing repos and installing podman, python3, curl"
+zypper -n --gpg-auto-import-keys refresh \
+  || log "zypper refresh reported a non-zero exit, continuing"
+# python3, not python3-base: the base-vs-full split of json/yaml handling has
+# moved across openSUSE releases. PyYAML is only used by step 4's override but
+# is installed unconditionally, so that path can't fail on a missing module.
+zypper -n install podman python3 python3-PyYAML curl \
+  || log "zypper install reported a non-zero exit (packages may already be present), continuing"
+
+log "step 2/9: enabling podman.socket"
+systemctl enable --now podman.socket
+
+log "step 3/9: pulling ${elemental_image}"
+podman pull "${elemental_image}"
+
+log "step 4/9: fetching the release manifest from ${aif_release_manifest_url}"
+# Curled rather than embedded in cloud-init: several KB against the 32 KiB
+# user_data ceiling, for no benefit -- the jumphost needs network access anyway.
+curl -fsS -o "${config_dir}/release_manifest.aif.yaml" "${aif_release_manifest_url}"
+
+# Two independent rewrites of the fetched manifest, in one Python step:
+#
+#  1. Core platform override (var.core_platform_override). Empty means "not
+#     set". When set, the two-level chain is FLATTENED into one local core
+#     manifest rather than redirected, because the resolver hard-forces an
+#     oci:// prefix onto corePlatform.image -- only the top-level manifestURI
+#     takes file://. release.yaml needs no change: the same path now holds a
+#     core manifest, and the resolver accepts either kind.
+#
+#  2. Systemd extension image overrides (var.sysext_image_overrides). The
+#     manifest pins each extension's OCI image and release.yaml has no field
+#     to override it, so the only place to change it is here.
+#
+# Either one alone is enough to need the rewrite; with neither, the fetched
+# manifest is used byte for byte.
+CORE_OS_BASE="${core_os_image_base}"
+CORE_OS_ISO="${core_os_image_iso}"
+CORE_K8S_VERSION="${core_k8s_version}"
+CORE_K8S_IMAGE="${core_k8s_image}"
+# Single-quoted: the value is JSON, full of double quotes. Both the keys and
+# the values are validated quote-free and whitespace-free in variables.tf.
+SYSEXT_OVERRIDES='${sysext_image_overrides_json}'
+
+if [ -z "$CORE_OS_ISO" ] && [ "$SYSEXT_OVERRIDES" = "{}" ]; then
+  log "no core platform override and no sysext image overrides -- using the AIF manifest chain unmodified"
+  mv "${config_dir}/release_manifest.aif.yaml" "${config_dir}/release_manifest.yaml"
+else
+  if [ -n "$CORE_OS_ISO" ]; then
+    log "core platform override set -- flattening AIF manifest onto OS image $CORE_OS_ISO"
+  else
+    log "no core platform override -- keeping the AIF manifest chain, rewriting extension images only"
+  fi
+  [ "$SYSEXT_OVERRIDES" = "{}" ] || log "sysext image overrides: $SYSEXT_OVERRIDES"
+
+  python3 - "${config_dir}" "$CORE_OS_BASE" "$CORE_OS_ISO" \
+            "$CORE_K8S_VERSION" "$CORE_K8S_IMAGE" "${cluster_name}" \
+            "$SYSEXT_OVERRIDES" <<'PYEOF'
+import json, sys, yaml
+
+config_dir, base, iso, kver, kimage, cluster, sysext_json = sys.argv[1:8]
+overrides = json.loads(sysext_json)
+
+with open(config_dir + "/release_manifest.aif.yaml") as f:
+    aif = yaml.safe_load(f) or {}
+
+components = aif.get("components") or {}
+
+# Rewrite extension images in place, BEFORE the flatten below copies
+# components.systemd across, so one edit covers both output shapes.
+#
+# Unknown names are fatal. A typo here would otherwise override nothing at all
+# and leave the build to fail forty minutes later on the node, as a missing
+# binary inside a crash-looping pod -- which is exactly how the open-iscsi
+# problem presented the first time.
+#
+# The variable ships a non-empty default, so this can also fire on a manifest
+# that simply does not declare the extension rather than on a typo. The message
+# names the escape hatch for that case.
+if overrides:
+    extensions = (components.get("systemd") or {}).get("extensions") or []
+    known = {e.get("name") for e in extensions if e.get("name")}
+    unknown = sorted(set(overrides) - known)
+    if unknown:
+        sys.exit(
+            "sysext_image_overrides names extension(s) absent from the release "
+            "manifest: %s. The manifest declares: %s. Fix the name, or set "
+            "sysext_image_overrides = {} to follow this manifest's own pins."
+            % (", ".join(unknown), ", ".join(sorted(known)) or "(none)")
+        )
+    for extension in extensions:
+        name = extension.get("name")
+        if name in overrides:
+            print("overriding extension %s: %s -> %s"
+                  % (name, extension.get("image"), overrides[name]))
+            extension["image"] = overrides[name]
+
+if iso:
+    # schema omitted deliberately: a manifest without one defaults to v0, the
+    # only version whose core Components type this script knows how to
+    # populate.
+    manifest = {
+        "metadata": {
+            "name": cluster + "-core-platform",
+            # v0 requires a version; reuse the AIF manifest's so the generated
+            # file still traces back to the chart set it carries.
+            "version": str((aif.get("metadata") or {}).get("version", "0.0.0")),
+        },
+        "components": {
+            "operatingSystem": {"image": {"base": base, "iso": iso}},
+            "kubernetes": {"version": kver, "image": kimage},
+        },
+    }
+
+    # Everything the solution manifest contributed beyond corePlatform.image; a
+    # v0 core manifest's Components accepts the same systemd/helm types.
+    for key in ("systemd", "helm"):
+        value = components.get(key)
+        if value:
+            manifest["components"][key] = value
+else:
+    # No flatten: hand back the solution manifest as fetched, minus the
+    # extension images just rewritten. Comments do not survive the round trip
+    # through yaml, which costs nothing -- the resolver never reads them.
+    manifest = aif
+
+with open(config_dir + "/release_manifest.yaml", "w") as f:
+    yaml.safe_dump(manifest, f, sort_keys=False)
+PYEOF
+  rm -f "${config_dir}/release_manifest.aif.yaml"
+  log "generated release manifest:"
+  cat "${config_dir}/release_manifest.yaml"
+fi
+
+log "step 5/9: running elemental customize against ${config_dir}"
+# No --local and no podman.sock mount: --local expects every OCI image
+# elemental3 unpacks at build time -- not just ${elemental_image} -- to already
+# be in the local store, erroring "No such image" instead of pulling, and there
+# is no confirmed list of which images that covers. The build runs once per
+# apply, so --local's faster-repeat-build benefit buys nothing here.
+#
+# --security-opt label=disable: SELinux-enforcing build hosts default to
+# denying the container the broad device/filesystem access it needs to build a
+# raw disk image.
+podman run --rm \
+  --security-opt label=disable \
+  -v "${config_dir}:/config" \
+  "${elemental_image}" customize --type raw
+
+log "step 6/9: locating produced raw image"
+RAW_IMAGE=$(ls -t "${config_dir}"/image-*.raw 2>/dev/null | head -n1 || true)
+if [ -z "$RAW_IMAGE" ]; then
+  log "ERROR: no ${config_dir}/image-*.raw produced by elemental customize"
+  exit 1
+fi
+log "found raw image: $RAW_IMAGE"
+# Apparent size first: that is what actually gets dd'd onto the target disk --
+# the raw is sparse, so the on-disk figure understates the work ahead and the
+# apparent one is the number that matters.
+log "raw image: $(du -h --apparent-size "$RAW_IMAGE" | cut -f1) apparent, $(du -h "$RAW_IMAGE" | cut -f1) on disk"
+
+log "step 7/9: resolving the target disk"
+
+# Resolves the device node for the blank disk evroc attached for this build
+# (named image_target_disk_name, sized image_target_disk_gb) by evidence
+# rather than assumption. The device path is not knowable at Terraform render
+# time -- see image-build.tf's own comment on why the script is not simply
+# told it -- so this has to work it out on the jumphost itself.
+#
+# THE AMBIGUITY RISK IS REAL: writing to the wrong device here does not
+# corrupt a spare disk, it destroys the jumphost's own root filesystem, since
+# the boot disk is just another virtio/SCSI block device from inside the
+# guest. Every branch below either finds exactly one disk it can justify, or
+# refuses to guess.
+resolve_target_disk() {
+  local matches match_count
+
+  # First choice: a by-id entry carrying the disk's own NAME. evroc does not
+  # currently produce one -- the serial is opaque -- but evroc's own docs
+  # illustrate the scheme with a name-like serial ("hs-my-data-disk"), so this
+  # may start working. It costs one find and is the least inferential branch
+  # available, so it stays first.
+  matches=$(find /dev/disk/by-id -maxdepth 1 -iname "*${image_target_disk_name}*" \
+    -exec readlink -f {} \; 2>/dev/null | sort -u)
+
+  if [ -n "$matches" ]; then
+    match_count=$(printf '%s\n' "$matches" | wc -l)
+    if [ "$match_count" -eq 1 ]; then
+      log "resolved target disk via /dev/disk/by-id name match: $matches"
+      printf '%s\n' "$matches"
+      return 0
+    fi
+    log "multiple /dev/disk/by-id entries matched \"${image_target_disk_name}\" ($match_count) -- not definitive, trying the SCSI bus"
+  fi
+
+  # Second choice, and in practice THE one: evroc documents hotswap disks as
+  # SCSI devices addressed at
+  #   /dev/disk/by-id/scsi-0QEMU_QEMU_HARDDISK_<SERIAL>
+  # and the serial is assigned by the platform, so it is unknowable when this
+  # script is rendered -- evroc_hotswap_disk_attachment.serial only exists
+  # AFTER the attachment, which itself requires the jumphost, whose user data
+  # is this script. Naming the exact serial would be a dependency cycle.
+  #
+  # The bus itself resolves it without the serial. A jumphost's boot disk is
+  # virtio (vda) and its config drive is virtio (vdb); NEITHER appears under
+  # /dev/disk/by-id at all, so a scsi-0QEMU_QEMU_HARDDISK_* glob cannot match
+  # them however it is written. That is a structural guarantee rather than a
+  # heuristic, which is what makes this better than the size comparison below:
+  # it does not depend on knowing whether evroc's "GB" means 10^9 or 2^30, and
+  # it does not depend on the target happening to be the only unpartitioned
+  # disk.
+  #
+  # It does assume exactly one hotswap disk is attached, which is what this
+  # module attaches. evroc permits up to 255, so a count other than one is
+  # someone else's disk on this jumphost and the right response is to stop,
+  # not to pick.
+  matches=$(find /dev/disk/by-id -maxdepth 1 -name 'scsi-0QEMU_QEMU_HARDDISK_*' \
+    -exec readlink -f {} \; 2>/dev/null | sort -u)
+
+  if [ -n "$matches" ]; then
+    match_count=$(printf '%s\n' "$matches" | wc -l)
+    if [ "$match_count" -eq 1 ]; then
+      log "resolved target disk via the SCSI hotswap bus (/dev/disk/by-id/scsi-0QEMU_QEMU_HARDDISK_*): $matches"
+      printf '%s\n' "$matches"
+      return 0
+    fi
+    log "ERROR: $match_count hotswap SCSI disks are attached to this jumphost, and this module attaches exactly one. Refusing to guess which is the image target -- detach the others, or identify the right one by serial from evroc_hotswap_disk_attachment.serial."
+    printf '%s\n' "$matches" | while IFS= read -r line; do log "  $line"; done
+    return 1
+  fi
+
+  log "no hotswap SCSI disk found yet; falling back to size/partition-table exclusion"
+
+  local root_source root_dev
+  # The sed strips a btrfs subvolume suffix: on openSUSE, findmnt reports the
+  # root as "/dev/vda2[/@/.snapshots/1/snapshot]", and readlink -f on that
+  # whole string resolves nothing. Without the strip, root_dev comes back
+  # empty, the boot disk is never excluded, and the only thing standing
+  # between this script and the jumphost's own root is the partition-table
+  # check below.
+  root_source=$(findmnt -n -o SOURCE / | sed 's/\[.*\]//')
+  root_dev=$(basename "$(readlink -f "$root_source" | sed -E 's/p?[0-9]+$//')")
+  if [ -z "$root_dev" ]; then
+    log "ERROR: could not determine the root filesystem's block device from '$(findmnt -n -o SOURCE /)'. Refusing to continue -- the exclusion below is what keeps dd off this host's own root."
+    return 1
+  fi
+  log "root filesystem device (excluded from candidates): $root_dev"
+
+  # 20%, which is far looser than a size check would normally want, for one
+  # reason: it is not known whether evroc's disk "size in GB" means 10^9 or
+  # 2^30 bytes. Those differ by 7.4%, so any tolerance under that risks
+  # rejecting the correct disk outright. A loose bound is safe here because
+  # the discriminator doing the real work is "has no partition table, and is
+  # not the root device" -- on a jumphost with exactly two disks, one of them
+  # partitioned and booted, that already leaves at most one candidate.
+  local expected_bytes tolerance_bytes
+  expected_bytes=$((${image_target_disk_gb} * 1000 * 1000 * 1000))
+  tolerance_bytes=$((expected_bytes / 5)) # 20%
+
+  local candidates=()
+  local report=""
+  local dev_path dev size_sectors size_bytes has_parts diff part
+
+  for dev_path in /sys/block/vd* /sys/block/sd* /sys/block/xvd*; do
+    [ -e "$dev_path" ] || continue
+    dev=$(basename "$dev_path")
+
+    if [ "$dev" = "$root_dev" ]; then
+      continue
+    fi
+
+    size_sectors=$(cat "$dev_path/size" 2>/dev/null || echo 0)
+    size_bytes=$((size_sectors * 512))
+
+    has_parts=false
+    for part in "$dev_path"/"$dev"[0-9]*; do
+      [ -e "$part" ] && has_parts=true
+    done
+
+    diff=$((size_bytes > expected_bytes ? size_bytes - expected_bytes : expected_bytes - size_bytes))
+    report="$report  /dev/$dev: size=$${size_bytes} bytes (expected $${expected_bytes}), partitions=$has_parts
+"
+
+    if [ "$has_parts" = false ] && [ "$diff" -le "$tolerance_bytes" ]; then
+      candidates+=("/dev/$dev")
+    fi
+  done
+
+  if [ "$${#candidates[@]}" -eq 1 ]; then
+    log "resolved target disk via size/partition-table exclusion: $${candidates[0]}"
+    printf '%s\n' "$${candidates[0]}"
+    return 0
+  fi
+
+  log "ERROR: could not unambiguously resolve the target disk ($${#candidates[@]} candidate(s) survived size/partition-table exclusion). Refusing to guess -- writing to the wrong device would destroy this jumphost's own root filesystem."
+  log "candidates considered:"
+  printf '%s' "$report" | while IFS= read -r line; do log "$line"; done
+  return 1
+}
+
+# Bounded retry: the hotswap attachment can land on the platform after
+# cloud-init (and therefore this script) has already started, so the device
+# may simply not exist yet on the first few attempts.
+TARGET=""
+ATTEMPT=0
+MAX_ATTEMPTS=20
+until [ -n "$TARGET" ] || [ "$ATTEMPT" -ge "$MAX_ATTEMPTS" ]; do
+  ATTEMPT=$((ATTEMPT + 1))
+  if TARGET=$(resolve_target_disk); then
+    break
+  fi
+  TARGET=""
+  log "target disk not found/ambiguous yet (attempt $ATTEMPT/$MAX_ATTEMPTS) -- waiting 15s for the attachment to land"
+  sleep 15
+done
+
+if [ -z "$TARGET" ]; then
+  log "ERROR: target disk never became unambiguously resolvable after $MAX_ATTEMPTS attempts"
+  exit 1
+fi
+
+log "step 8/9: writing $RAW_IMAGE onto $TARGET"
+# conv=sparse is deliberately NOT used here. image_target is a persistent disk
+# that outlives this jumphost and survives across rebuilds -- it is the medium
+# evroc_snapshot is taken from, not scratch space -- so a zero region in this
+# raw image has to actually be WRITTEN as zeros. With conv=sparse, dd would
+# instead seek over those regions and leave whatever non-zero bytes a PREVIOUS
+# build wrote at that offset showing through underneath the new one.
+dd if="$RAW_IMAGE" of="$TARGET" bs=4M conv=fsync status=progress
+sync
+blockdev --flushbufs "$TARGET"
+
+log "verifying: checking for a GPT signature at offset 512"
+SIG=$(dd if="$TARGET" bs=1 skip=512 count=8 status=none)
+if [ "$SIG" != "EFI PART" ]; then
+  log "ERROR: no GPT signature ('EFI PART') found at offset 512 on $TARGET after writing -- got: $SIG"
+  exit 1
+fi
+log "GPT signature confirmed"
+
+mkdir -p "$SENTINEL_DIR"
+sha256sum "$RAW_IMAGE" | cut -d' ' -f1 > "$SENTINEL_DIR/image.sha256"
+log "raw image sha256: $(cat "$SENTINEL_DIR/image.sha256")"
+
+# --- boot diagnostics ------------------------------------------------------
+#
+# Loop-mounts the image that was just built and records the two facts that
+# decide whether a node will boot at all. Deliberately NON-FATAL: a node that
+# cannot boot is invisible on evroc -- there is no serial console and no VNC
+# (see PLATFORM-NOTES.md), the VM reports Running, and the only symptom is that
+# nothing ever answers on port 22. This file is the one chance to look inside
+# the image while something is still reachable to look from.
+#
+# The two facts:
+#
+#   1. That kernelCmdLine from install.yaml -- specifically
+#      ignition.platform.id -- reached Install/install.yaml on the media, which
+#      is what the installer applies to the system it lays down. The image
+#      itself is installation media and boots with elemental's own recovery
+#      command line, so this is the only place ours can be seen before a node
+#      exists.
+#
+#   2. Which device labels this image's own Ignition binary searches for. The
+#      provider's labels are string literals in the binary, so this answers
+#      empirically what the docs only imply.
+#
+# Both were assumptions until a real node hung forever in Ignition
+# (fetch-offline) with `no limit`: the platform id was `kubevirt`, whose
+# provider polls for a drive labelled `config-2` in an unbounded retry loop,
+# while evroc presents `cidata`. See PLATFORM-NOTES.md. If this file ever shows
+# a platform id whose provider does not name `cidata`, that is the same bug
+# returning.
+DIAG="$SENTINEL_DIR/boot-diagnostics.txt"
+
+# Everything worth knowing about one mounted tree, whether that tree is a
+# partition of the image or the LiveOS squashfs unpacked from inside it.
+inspect_boot_tree() {
+  local root=$1 cfg bin
+
+  # Two patterns, because elemental's GRUB does not put the command line in the
+  # boot entry: the entry reads `linux ... $${cmdline}` and $cmdline is assigned
+  # in grubenv. Matching only `linux`/`options` lines shows the variable and
+  # never its value, which is the one thing worth knowing.
+  echo "- kernel command line:"
+  find "$root" \( -name grub.cfg -o -name grubenv -o -path '*/loader/entries/*.conf' \) -type f 2>/dev/null |
+    while read -r cfg; do
+      grep -hnE 'cmdline|ignition\.platform\.id|^[[:space:]]*(linux|linuxefi|options)[[:space:]]|GRUB_CMDLINE' "$cfg" 2>/dev/null |
+        sed "s|^|  $${cfg#$root}: |"
+    done
+
+  # NOT /usr/bin/ignition -- there is no such path in this image. The binary
+  # ships inside the dracut module at /usr/lib/dracut/modules.d/30ignition/,
+  # so search rather than assume.
+  echo "- device labels the ignition binary searches for:"
+  find "$root" -type f -name ignition -perm -u+x 2>/dev/null |
+    while read -r bin; do
+      echo "  $${bin#$root}:"
+      strings "$bin" 2>/dev/null |
+        grep -iE '^(cidata|config-2|ignition|oem)$|by-label|kubevirt|nocloud' |
+        sort -u | sed 's|^|    |'
+    done
+
+  echo "- ignition dracut modules present:"
+  ls "$root/usr/lib/dracut/modules.d" 2>/dev/null | grep -i ignition | sed 's|^|  |'
+
+  echo "- units/generators that wait on a device labelled 'ignition':"
+  grep -rl 'by.x2dlabel-ignition\|by-label/ignition' \
+    "$root/usr/lib/dracut" "$root/usr/lib/systemd" 2>/dev/null |
+    sed "s|$root||" | sed 's|^|  |'
+}
+
+collect_boot_diagnostics() {
+  local loop mnt sq part label
+
+  # --partscan: the raw image is a whole disk with a GPT, so the ESP and SYSTEM
+  # partitions only appear as $${loop}p1/$${loop}p2 if the kernel is asked to read
+  # the table. --read-only so nothing here can perturb the artefact that was
+  # just dd'd out.
+  loop=$(losetup --find --show --partscan --read-only "$RAW_IMAGE") || return 1
+  mnt=$(mktemp -d)
+
+  {
+    echo "=== boot diagnostics for build ${build_id} ($(date -u +%Y-%m-%dT%H:%M:%SZ)) ==="
+    echo "raw image: $RAW_IMAGE"
+    echo
+
+    # The partition table itself, first. A partition that is missing entirely
+    # and one that failed to mount look identical in the sections below, and
+    # the difference matters: SYSTEM is where the ignition binary lives.
+    echo "- partition table:"
+    lsblk -o NAME,SIZE,LABEL,FSTYPE "$loop" 2>&1 | sed 's|^|  |'
+    echo
+
+    for part in "$loop"p*; do
+      [ -b "$part" ] || continue
+      label=$(blkid -o value -s LABEL "$part" 2>/dev/null || true)
+
+      echo "--- partition $part (label: $${label:-none})"
+
+      # No -t: the ESP is vfat and SYSTEM is btrfs, and the btrfs mount lands on
+      # the top-level subvolume, so paths below carry an @/ prefix. find copes.
+      # The error is kept rather than discarded -- an unmountable SYSTEM is a
+      # finding in its own right, not a reason to print three empty sections.
+      mount -o ro "$part" "$mnt" 2>&1 | sed 's|^|  mount failed: |'
+      if ! mountpoint -q "$mnt"; then
+        echo "  (not mounted -- nothing inspected)"
+        echo
+        continue
+      fi
+
+      inspect_boot_tree "$mnt"
+
+      # What this image actually IS: installation media, not a node image. Two
+      # partitions, EFI and RECOVERY, with the rest of the GPT unallocated; the
+      # GRUB entry says "(Installer)"; the node's real root is created by the
+      # installer on first boot. So the OS that eventually hangs is not on any
+      # partition here -- it is the squashfs on RECOVERY, and Install/install.yaml
+      # next to it is the only place our kernelCmdLine can be seen to have
+      # survived the build. Both are worth more than anything above.
+      if [ -f "$mnt/Install/install.yaml" ]; then
+        echo "- Install/install.yaml (what the installer will apply):"
+        sed 's|^|  |' "$mnt/Install/install.yaml"
+      fi
+
+      if [ -f "$mnt/LiveOS/squashfs.img" ]; then
+        echo "- LiveOS/squashfs.img (the system that gets installed):"
+        sq=$(mktemp -d)
+        mount -o ro "$mnt/LiveOS/squashfs.img" "$sq" 2>&1 | sed 's|^|  mount failed: |'
+        if mountpoint -q "$sq"; then
+          inspect_boot_tree "$sq" | sed 's|^|  |'
+          umount "$sq" 2>/dev/null || true
+        fi
+        rmdir "$sq" 2>/dev/null || true
+      fi
+
+      echo
+      umount "$mnt" 2>/dev/null || true
+    done
+  } > "$DIAG" 2>&1
+
+  rmdir "$mnt" 2>/dev/null || true
+  losetup -d "$loop" 2>/dev/null || true
+}
+
+log "recording boot diagnostics to $DIAG (non-fatal)"
+if collect_boot_diagnostics; then
+  log "boot diagnostics written -- read them with: cat $DIAG"
+else
+  log "WARNING: could not collect boot diagnostics (image still built fine); continuing"
+fi
+
+log "step 9/9: writing sentinel"
+# Written LAST and ONLY on success. wait-for-image.sh, running on the
+# operator's machine, treats this file's presence -- carrying exactly this
+# build id -- as the sole definition of "the build is done".
+printf '%s\n' "${build_id}" > "$SENTINEL"
+
+log "=== image-factory finished successfully: $TARGET now holds the built image ==="
+log "the target disk is not detached or snapshotted here -- that happens on the NEXT terraform apply, once var.image_ready is flipped to true (see image-build.tf's evroc_hotswap_disk_attachment.image_target and snapshot.tf)"

@@ -1,0 +1,46 @@
+# release_manifest.yaml is fetched into the config dir by image-factory.sh, so
+# the exact bytes are local to this build. It lists every available helm chart
+# with its repository/version/values; components below only says which to
+# enable. With var.core_platform_override set, image-factory.sh flattens the AIF
+# solution manifest into a core platform manifest pinning the OS and Kubernetes
+# images -- the resolver accepts either kind here. MetalLB is not in the
+# manifest at all; apiVIPMode: external (cluster.yaml) is what keeps it out.
+manifestURI: file://./release_manifest.yaml
+
+components:
+  kubernetes: {}
+%{ if length(sysexts) > 0 ~}
+  # systemd system extensions. The key is `systemd` and the list items are
+  # keyed `extension` -- NOT `systemd.extensions` with `name`, which is the
+  # release MANIFEST's schema, a different file with a different type
+  # (internal/image/release/release.go: SystemdExtension{Name string
+  # `yaml:"extension"`}). Naming one here is what
+  # isExtensionExplicitlyEnabled() looks at; each must also exist in the
+  # manifest, or the build fails with "requested systemd extension(s) not
+  # found". Omitted entirely when empty, so the default chart set renders the
+  # same bytes it always has.
+  systemd:
+%{ for e in sysexts ~}
+    - extension: ${e}
+%{ endfor ~}
+%{ endif ~}
+  helm:
+%{ for c in components ~}
+    - chart: ${c.chart}
+%{ if c.values_file != null ~}
+      valuesFile: ${c.values_file}
+%{ endif ~}
+%{ if c.chart_credentials ~}
+      # application-collection (oci://dp.apps.rancher.io/charts) needs auth.
+      #
+      # jsonencode(), not bare interpolation: an appco token containing ":",
+      # "#", a leading "{"/"["/"*"/"&"/"!" or a trailing space is either a YAML
+      # parse error or -- worse -- parses to a different string, and the build
+      # then dies forty minutes in with an auth failure against a password
+      # nobody mistyped. A JSON string is always a valid YAML scalar. Same
+      # reasoning as kubernetes/helm/values/suse-storage.yaml.tftpl.
+      credentials:
+        username: ${jsonencode(appco_username)}
+        password: ${jsonencode(appco_password)}
+%{ endif ~}
+%{ endfor ~}

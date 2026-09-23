@@ -1,0 +1,67 @@
+# RKE2's CNI is canal: Calico for policy and the pod veths, Flannel for the
+# VXLAN dataplane on flannel.1. Three of its defaults are wrong here, and all
+# three fail quietly.
+#
+# Despite its path in this tree, this file is NOT part of the elemental image.
+# It is written by per-node Ignition straight into RKE2's own
+# /var/lib/rancher/rke2/server/manifests, on servers only. The why -- a measured
+# 104-second race that this file used to lose -- is in locals.tf, at
+# node_server_manifests.
+#
+#  1. flannel.iface defaults to blank, which the chart documents as "the
+#     interface is chosen using the node's default route". On the single-NIC
+#     node this module builds today that is a non-issue by construction:
+#     there is only one interface, so it IS the default-route interface, and
+#     regexIface is belt-and-braces here, matching an address range that only
+#     ever has one NIC to match against anyway.
+#
+#     It becomes load-bearing the moment a node ever carries more than one
+#     interface: flannel would then pick whichever one holds the default
+#     route, not necessarily the one this cluster's pod traffic is meant to
+#     cross, and there is nothing else in this stack that would notice or
+#     correct that choice.
+#
+#     99-node-ip.yaml does NOT cover this even then. It only pins kubelet's
+#     node-ip; flannel never reads it; it picks its own VTEP source
+#     independently.
+#
+#     regexIface rather than iface because the value can stay cluster-wide
+#     while NIC names differ from one node shape to the next. flannel's
+#     --iface-regex matches "IP or name" (flannel main.go:122), so matching
+#     the cluster's address range picks the right NIC on every node without
+#     naming any of them.
+#
+#  2. calico.vethuMTU defaults to 1450, sized for a 1500-byte underlay.
+#     Whatever MTU this node's NIC actually carries (${veth_mtu}, the same
+#     value configure-network.sh.tftpl applies to the NIC itself) sets the
+#     VXLAN payload ceiling instead, and a pod handed the chart's stock 1450
+#     veth overflows its own node's flannel.1 the moment the two disagree.
+#
+#  3. calico.felixPrometheusMetricsEnabled defaults to true, which binds
+#     Felix's metrics endpoint to 0.0.0.0:9091 -- on every interface a node
+#     has, including the single NIC that may also carry a NAT-attached public
+#     address. Nothing in this stack scrapes it, so there is no functional
+#     reason to expose it at all; disabling it here removes the port outright
+#     rather than relying on network topology or a firewall rule to keep it
+#     closed.
+#
+# Bouncing canal is required to pick any of these up on a RUNNING cluster: the
+# values land in the rke2-canal-config ConfigMap, which the DaemonSet reads
+# through env.valueFrom, so the pod template never changes and Helm has nothing
+# to roll. Irrelevant on a fresh build -- Ignition puts this on disk before RKE2
+# first starts -- but it is why a hot patch looks like a no-op.
+#
+# vethuMTU also only applies to veths created after the change, so on a running
+# cluster existing pods keep the old MTU until they are recreated.
+apiVersion: helm.cattle.io/v1
+kind: HelmChartConfig
+metadata:
+  name: rke2-canal
+  namespace: kube-system
+spec:
+  valuesContent: |-
+    flannel:
+      regexIface: '${iface_regex}'
+    calico:
+      vethuMTU: ${veth_mtu}
+      felixPrometheusMetricsEnabled: false

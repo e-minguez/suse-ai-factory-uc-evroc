@@ -1,0 +1,241 @@
+# --------------------------------------------------------------------------
+# Identity / region
+# --------------------------------------------------------------------------
+
+# region and project default to null -- "whatever `evroc login`'s context
+# says". Set either explicitly to pin this example to a specific
+# region/project regardless of the CLI's current context.
+# region  = null
+# project = null
+
+# The zones the cluster spans. One subnet and one control-plane placement
+# group per zone; control-plane nodes are assigned round-robin across the
+# list, so three zones and the default control_plane_count = 3 put one etcd
+# member in each.
+#
+# WHAT EACH EXTRA ZONE COSTS: evroc snapshots are ZONAL -- a disk cannot be
+# cloned from another zone's snapshot, and the provider has no snapshot-copy
+# operation -- so the elemental image cannot be built once and shared. Every
+# zone gets its own build host, its own image-target disk and its own
+# snapshot, and runs its own full build. Three zones means three concurrent
+# builds. They run in parallel, so this costs compute, not wall-clock time.
+#
+# Only zones[0]'s build host gets a public IP (see the public IP section
+# below); the rest are private-only and tunnelled through it.
+#
+# Set a single-element list, e.g. ["a"], for a single-AZ cluster: one build
+# host, one snapshot, and the cheapest shape this module has.
+#
+# Do not REORDER this list on an existing cluster: subnet CIDRs are assigned
+# by position, so reordering renumbers every subnet and replaces every node
+# in them. Appending is safe.
+zones = ["a", "b", "c"]
+
+# elemental_image defaults to registry.suse.com/beta/uc/elemental:3.1.0-6.5 --
+# a SUSE beta build, needed for apiVIPMode support. See
+# ../../modules/ai-factory-ha/README.md for the fallback if it's ever
+# superseded.
+
+# --------------------------------------------------------------------------
+# Access: SSH keys, admin CIDRs, password hashes
+# --------------------------------------------------------------------------
+
+# CIDRs allowed to SSH into the jumphost. Your admin IP(s)/VPN range, not
+# 0.0.0.0/0.
+admin_cidrs = ["REPLACE_WITH_YOUR_IP/32"]
+
+# At least one public key. Injected onto node_username on every elemental
+# node, onto the jumphost, and onto root too only if permit_root_ssh is true.
+ssh_authorized_keys = ["REPLACE_WITH_YOUR_ssh-ed25519_OR_ssh-rsa_PUBLIC_KEY"]
+
+# Generate both with: openssl passwd -6
+# root's is the console login and the password `su -` asks for; the node
+# user's is what gets you a shell. They must differ -- the module rejects the
+# plan if they do not, since sharing one credential is the thing the split
+# exists to avoid.
+root_password_hash      = "REPLACE_WITH_OUTPUT_OF_openssl_passwd_-6"
+node_user_password_hash = "REPLACE_WITH_A_DIFFERENT_OUTPUT_OF_openssl_passwd_-6"
+
+# Unprivileged login on the elemental nodes. Escalate with `su -` (sudo is
+# not installed in the image). Optional -- this is the default.
+# node_username = "suse"
+
+# Allow `ssh root@<node>` and give root the SSH keys too. Off by default.
+# Flipping it rebuilds the image and replaces every node.
+# permit_root_ssh = true
+
+# --------------------------------------------------------------------------
+# Credentials: AppCo, SUSE registration/registry, NVIDIA NGC
+#
+# SUSE AI Factory's Helm charts need two separate sets of registry
+# credentials. Neither has a default.
+# --------------------------------------------------------------------------
+
+# SUSE Application Collection (local-path-provisioner chart pull + image pull
+# secret, and aif-operator.yaml's credentials.applicationCollection).
+appco_username = "REPLACE_WITH_YOUR_APPLICATION_COLLECTION_USERNAME"
+appco_password = "REPLACE_WITH_YOUR_APPLICATION_COLLECTION_PASSWORD"
+
+# SUSE registry: the "username" here is always your registration code itself.
+suse_registration_code = "REPLACE_WITH_YOUR_SUSE_REGISTRATION_CODE"
+suse_registry_password = "REPLACE_WITH_YOUR_SUSE_REGISTRY_PASSWORD"
+
+# Optional: NVIDIA NGC API key (paired username is always "$oauthtoken",
+# hardcoded in the module). Left at its null default, aif-operator.yaml's
+# nvidia: credentials block is omitted entirely.
+# nvidia_api_key = "REPLACE_WITH_YOUR_NVIDIA_NGC_API_KEY"
+
+# --------------------------------------------------------------------------
+# Sizing
+# --------------------------------------------------------------------------
+
+# cluster_name        = "suse-ai-factory"
+# control_plane_count = 3
+# control_plane_flavor = "c1a.m"
+# jumphost_flavor      = "a1a.m"  # per BUILD HOST, and there is one per zone.
+                                 # 3 zones x a1a.l (8 vCPU) = 24, over a
+                                 # default project's 20 vCPU quota
+# jumphost_username    = "suse"  # non-root login on the jumphost, with
+                                 # passwordless sudo and the same SSH keys.
+                                 # "" for root-only; the elemental nodes are
+                                 # root-only either way
+
+# vpc_cidr = "10.20.0.0/16"     # must not overlap RKE2's default cluster-cidr
+                                # (10.42.0.0/16) or service-cidr (10.43.0.0/16)
+
+# Per-zone subnets are derived, not listed: zones[i] gets
+# cidrsubnet(vpc_cidr, subnet_newbits, i), so the defaults give 10.20.0.0/20,
+# 10.20.16.0/20 and 10.20.32.0/20. `terraform output subnet_cidrs` prints what
+# a given setting produced.
+# subnet_newbits = 4
+
+# --------------------------------------------------------------------------
+# Public IPs -- QUOTA'D, and the default evroc quota is 3.
+#
+# This module spends two before any node gets one: the API VIP (which is the
+# Kubernetes API endpoint, baked into the image) and the jumphost. That leaves
+# one, against three control-plane nodes -- so leaving these at their `true`
+# defaults FAILS PARTWAY THROUGH AN APPLY on a default project, with
+# "publicip-webhook.evroc.com denied the request: not enough quota".
+#
+# Two is the ceiling no matter how many zones you configure: the other zones'
+# build hosts deliberately get no public IP.
+#
+# Neither node type needs one to be reachable: the control plane answers
+# through the load balancer, and both are reachable from the jumphost inside
+# the VPC. Nor do they need one for EGRESS -- evroc's VPC gives every VM
+# outbound internet access without a public IP, which is what the runtime
+# pulls (Rancher, the GPU operator's driver containers, the AppCo charts)
+# depend on.
+# --------------------------------------------------------------------------
+control_plane_public_ip = false
+gpu_public_ip           = false
+
+# --------------------------------------------------------------------------
+# GPU worker pools. GPU nodes boot the same snapshot clone as the control
+# plane. A project that predates evroc lifting the snapshot-disk restriction
+# (2026-09-23) fails a GPU VM with "Ready: disk is missing DiskImageRef
+# (ProvisioningFailed)" -- ../../PLATFORM-NOTES.md has the detail.
+#
+# Empty by default (control-plane-only cluster). Real GPU
+# flavors are gn-l40s.{s,m,l} and gn-b200.{s,m,l,xl}; both sit at the
+# expensive end of evroc's price list, so nothing is provisioned unless asked
+# for. Pool names become node hostnames ("<cluster_name>-<pool>-NN"), must be
+# unique, 1-16 characters of [a-z0-9-], and "cp" is reserved for the control
+# plane. Adding a pool, renaming one, or bumping a count is a plain
+# Terraform add/replace of just the affected nodes -- no image rebuild.
+# --------------------------------------------------------------------------
+# Optionally per pool:
+#
+#   zone                pin the pool to one zone. Default: round-robin across
+#                       `zones`, like the control plane. Pin it when a flavor's
+#                       stock only exists in one zone, which is usual --
+#                       otherwise the nodes that land elsewhere fail to create
+#                       with an out-of-capacity error.
+#   placement_strategy  "spread" (anti-affinity: no two of the pool's nodes on
+#                       one host -- for inference, where a host failure should
+#                       cost one replica) or "cluster" (affinity: pack the pool
+#                       together for the lowest inter-node latency -- for
+#                       training collectives). Omitted means no placement group
+#                       at all, leaving the scheduler unconstrained.
+#
+# A "cluster" pool must also set `zone`: placement groups are zonal, so packing
+# nodes tightly within each of three zones is not what "cluster" asks for.
+#
+# Two limits shape these numbers, and both are enforced by an admission webhook
+# at APPLY time rather than at plan time:
+#   - GPU VMs run in zone "a" only (var.gpu_zones). An unpinned pool is placed
+#     there automatically; pinning it anywhere else fails during plan.
+#   - GPU quota is per GPU MODEL, and a default project holds ONE of each.
+#     The FLAVOR SIZE IS THE GPU COUNT -- gn-l40s.s is 1 GPU, .m is 2, .l is 4
+#     -- and the webhook is handed count * that, so even count = 1 on gn-l40s.m
+#     fails with "not enough quota ... Only 1 nvidia.com/AD102GL_L40S GPUs
+#     available (out of 1 in quota)". gn-l40s.s at count = 1 is the only pool
+#     an unmodified project can apply.
+# `terraform plan` prints the resulting demand in the gpu_quota_request output;
+# ask evroc to raise the quota before asking for more than it says.
+#
+# gpu_pools = {
+#   inference = { flavor = "gn-l40s.m", count = 1, placement_strategy = "spread" }
+#   training  = { flavor = "gn-b200.l", count = 1, zone = "a", placement_strategy = "cluster" }
+# }
+
+# --------------------------------------------------------------------------
+# Components -- which SUSE AI Factory Helm charts release.yaml enables.
+# Rendered in a fixed canonical order regardless of the order typed here.
+# Changing this rebuilds the image and replaces every node.
+# --------------------------------------------------------------------------
+# components = ["rancher", "gpu-operator", "local-path-provisioner", "aif-operator"]  # the default
+
+# suse-storage (Longhorn) instead of local-path-provisioner. NOT a migration
+# from the default -- a new cluster, with a different default StorageClass
+# and no data carried across. cert-manager is still injected automatically
+# because "rancher" is listed.
+# components = ["rancher", "suse-storage", "aif-operator"]
+
+# ingress_controller = "traefik"       # "traefik" (default), "ingress-nginx" or "none"
+# ingress_cidrs      = ["0.0.0.0/0"]   # who may reach the ingress listeners (80/443)
+
+# rancher_hostname           = null  # defaults to "rancher-<api_vip>.sslip.io"
+# rancher_bootstrap_password = null  # defaults to a generated password
+# api_host                   = null  # defaults to "rke2-<api_vip>.sslip.io", added to the
+                                      # API server certificate's SANs
+
+# --------------------------------------------------------------------------
+# Image build
+# --------------------------------------------------------------------------
+
+# AI Factory version. Picks the manifest from SUSE/aif's aif-operator-<version>
+# TAG, so it must be a full X.Y.Z -- there is no "2.2" tag. Pre-releases are
+# tags too ("2.3.0-dev.2", "2.2.0-rc.1"). 2.1.0 is the oldest tag that has a
+# manifest at all. `git ls-remote --tags https://github.com/SUSE/aif` lists them.
+# aif_version = "2.2.0"
+
+# Overrides aif_version completely. Only needed for a manifest that is not on
+# a tag -- a branch ref, a fork, a mirror.
+# aif_release_manifest_url = "https://raw.githubusercontent.com/SUSE/aif/refs/heads/main/uc-release-manifest/release_manifest.yaml"
+
+# ALREADY ON BY DEFAULT; listed here to be re-pinned, not to be enabled, and
+# NOT to be set to null. See ../../modules/ai-factory-ha/README.md and
+# ../../PLATFORM-NOTES.md. Unset, the build follows the release manifest's
+# corePlatform.image to a GA 16.0 OS image whose elemental3ctl silently ignores
+# bootloader.initrdExtensions, which is the sole delivery mechanism for the
+# Kubernetes firstboot chain -- the node installs, boots, and has no rke2 units
+# and no error anywhere. The default below is the beta 16.1 line, which honours
+# the key.
+# core_platform_override = {
+#   os_image_base      = "registry.suse.com/beta/uc/base-os-kernel-default:16.1-73.2"
+#   os_image_iso       = "registry.suse.com/beta/uc/base-os-kernel-default-iso:16.1-73.3"
+#   kubernetes_version = "v1.35.6+rke2r1"
+#   kubernetes_image   = "registry.suse.com/elemental/rke2/rke2-tar:1.35.6_rke2r1-9.1"
+# }
+
+# sysext_image_overrides -- the sibling of core_platform_override, for the
+# same reason: beta bits. ALREADY ON BY DEFAULT; listed here to be overridden,
+# not to be enabled. Inert unless "suse-storage" is in components.
+# sysext_image_overrides = {
+#   suse-storage = "registry.suse.com/beta/uc/longhorn:5.279-4.13"  # the default
+# }
+
+# image_disk_size = "8G"  # size of the built raw/snapshot only -- the running node's
+                           # disk gets expanded to node_disk_gb at first boot regardless

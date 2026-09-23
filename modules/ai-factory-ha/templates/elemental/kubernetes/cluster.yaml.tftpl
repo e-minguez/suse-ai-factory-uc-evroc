@@ -1,0 +1,48 @@
+# THERE IS DELIBERATELY NO nodes: LIST HERE.
+#
+# Every node's RKE2 role comes from /var/lib/elemental/runtime.env, written per
+# node by Ignition user_data (locals.tf's node_runtime_ignition) -- NODETYPE for
+# all of them, plus IS_INIT_NODE=true on cp-01 only. That is the shape SUSE's own
+# multi-node example uses (SUSE/elemental#579,
+# examples/elemental/runtime-configs/multi-node/), and it makes this file
+# independent of how many nodes exist or what they are called.
+#
+# That independence is the point. This file is part of elemental_files, whose
+# sha256 is a trigger on time_static.build, which names the snapshot, which is
+# ForceNew on every node. Anything node-shaped in here means changing the node
+# set rebuilds the image and replaces the running cluster. With the list gone,
+# adding a GPU node is an add, not a rebuild.
+#
+# Why the empty list is safe, read out of elemental on main:
+#
+#  * internal/config/kubernetes.go:110 -- with no nodes, elemental writes its own
+#    /var/lib/elemental/runtime.env carrying IS_INIT_NODE=true NODETYPE=server.
+#    It goes in via butaneCfg, i.e. into base.d, and Ignition merges base.d first
+#    and the platform config (our per-node user_data, overwrite: true) on top. So
+#    ours wins, per node. Upstream's example relies on exactly this.
+#  * internal/config/templates/k8s_conf_deploy.sh.tpl -- NODETYPE resolves as
+#    : "$${NODETYPE:=$${hosts[$$HOSTNAME]:-}}", and the unit sources runtime.env
+#    first, so the hosts[] table built from this list is never consulted. Nothing
+#    validates that a booting node is listed, and nothing waits for listed nodes.
+#  * internal/config/templates/k8s-resource-installer.service.tpl -- with no init
+#    node to pin, the Helm/manifest deploy is gated by
+#    ExecCondition=[ "$IS_INIT_NODE" = "true" ] against runtime.env instead of
+#    ConditionHost=<hostname>. Same single-runner guarantee, sourced from the
+#    same per-node file as the role.
+#  * internal/image/kubernetes/cluster.go:129 -- setServerDefaults reads only
+#    Network below, never Nodes, so server: https://<apiVIP>:9345 and the tls-san
+#    entries are produced either way. Joining does not depend on the list.
+#
+# Hostnames are still set per node (Ignition writes /etc/hostname); they are just
+# no longer declared here.
+
+network:
+  apiVIP: ${api_vip}
+  # apiVIPMode: external needs an elemental build carrying SUSE/elemental#578;
+  # it suppresses MetalLB/ECO and hands the address to evroc's own load
+  # balancer.
+  apiVIPMode: ${api_vip_mode}
+  # Joins the API server certificate's SANs, so a kubeconfig can use this name
+  # instead of the bare apiVIP. sslip.io resolves the embedded address, which
+  # keeps that true without anyone running a DNS zone.
+  apiHost: ${api_host}

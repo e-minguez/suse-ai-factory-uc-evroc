@@ -1,0 +1,48 @@
+# RKE2 packages Traefik as a DaemonSet taking hostPort 80/443, so every node it
+# lands on answers on all of its own addresses. Three changes from the defaults:
+#
+#  1. nodeSelector -- unpinned it would also bind 80/443 on every GPU worker
+#     node, which is not what those nodes are for. Pinning this DaemonSet to
+#     the control planes keeps the ingress hostPorts off GPU worker nodes
+#     entirely.
+#  2. proxyProtocol -- on evroc, proxy protocol is a per-backend-service
+#     setting on the load balancer (network.tf), not a listener-wide default.
+#     It has to be turned on there and here TOGETHER, or the listener breaks:
+#     enable it only on the backend service and Traefik reads the PROXY
+#     header as request bytes; enable it only here and Traefik blocks waiting
+#     for a header that never arrives. trustedIPs is the VPC-facing CIDR,
+#     because that is the address range the load balancer dials backends
+#     from, and evroc reports that nowhere else for Traefik to pick up
+#     automatically. This makes the header REQUIRED from that range, not
+#     optional -- hence (3).
+#  3. ports.traefik.hostPort -- /ping for the LB's health check, on an
+#     entrypoint with no proxy protocol. Not forwarded, and not public.
+apiVersion: helm.cattle.io/v1
+kind: HelmChartConfig
+metadata:
+  name: rke2-traefik
+  namespace: kube-system
+spec:
+  valuesContent: |-
+    nodeSelector:
+      node-role.kubernetes.io/control-plane: "true"
+    # Not needed today -- this module taints nothing -- but a DaemonSet pinned
+    # to the control plane has no other way to survive someone adding the
+    # conventional taints later.
+    tolerations:
+      - key: node-role.kubernetes.io/control-plane
+        operator: Exists
+        effect: NoSchedule
+      - key: CriticalAddonsOnly
+        operator: Exists
+    ports:
+      traefik:
+        hostPort: 8080
+      web:
+        proxyProtocol:
+          trustedIPs:
+            - ${vpc_cidr}
+      websecure:
+        proxyProtocol:
+          trustedIPs:
+            - ${vpc_cidr}

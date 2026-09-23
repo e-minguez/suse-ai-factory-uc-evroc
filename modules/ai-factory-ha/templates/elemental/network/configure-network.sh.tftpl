@@ -1,0 +1,123 @@
+#!/usr/bin/env bash
+# elemental's network/configure-network.sh hook, run in the initrd on first
+# boot under catalyst-net-initrd-script.service. Hostname and RKE2 role are
+# NOT set here -- they come from each node's Ignition user_data (locals.tf's
+# node_runtime_ignition); this script only ever touches link-level settings.
+#
+# evroc VMs are expected to carry exactly ONE NIC. When a public IP is
+# attached, it is 1:1 NAT onto that same interface, not a second NIC -- this
+# is being confirmed empirically, so the script below asserts the NIC count
+# itself rather than assuming it, and takes no nmstate action at all on any
+# node where the count is not exactly one.
+#
+# For the expected single-NIC case there is deliberately no nmstate document
+# and no invocation of nmc anywhere in this script. NetworkManager's own
+# default profile for the NIC already carries the address that matters, from
+# evroc's own DHCP; asking nmc to apply a document for that same interface --
+# even one that only restates "dhcp: true" -- makes NetworkManager build a
+# distinct profile and switch to it, which is a fresh DHCP DISCOVER rather
+# than a renewal of the lease already held. MTU and IPv6 are therefore set
+# directly against the kernel and /proc, bypassing NetworkManager's state
+# machine entirely, so neither of those can be mistaken for a second,
+# competing DHCP transaction.
+#
+# The NIC count is read from /sys/class/net/*/device -- a real NIC has a
+# backing device; lo and any virtual interface do not. There is no metadata
+# tree shaped like a per-interface listing on evroc to cross-check against,
+# so /sys is not just the primary signal here, it is the only one; if an
+# interface name is ever needed, it is read out of /sys/class/net as well.
+#
+# Restricted environment: this hook runs inside
+# catalyst-net-initrd-script.service's sandbox, which mounts everything
+# read-only except /proc, /sys and /dev -- so this script deliberately never
+# needs to stage a file anywhere. bash builtins only -- no
+# tr/basename/dirname/mktemp/jq/python3 -- to stay inside the toolbox
+# upstream's own examples demonstrate, and because none of those binaries are
+# guaranteed present in the initrd.
+set -euo pipefail
+
+log() {
+  echo "[configure-network] $*"
+}
+
+die() {
+  log "ERROR: $*"
+  exit 1
+}
+
+# Real NIC count from /sys, exactly as write-node-ip.sh.tftpl (which runs
+# later, in the real root) counts it -- so the two scripts always agree on the
+# node's shape.
+physical_ifaces=()
+for sys_path in /sys/class/net/*/device; do
+  [ -e "$sys_path" ] || continue
+  ifname=$${sys_path%/device}
+  ifname=$${ifname##*/}
+  physical_ifaces+=("$ifname")
+done
+log "found $${#physical_ifaces[@]} physical NIC(s) via /sys/class/net: $${physical_ifaces[*]:-none}"
+
+if [ "$${#physical_ifaces[@]}" -eq 0 ]; then
+  die "no physical NIC found under /sys/class/net -- nothing to configure"
+fi
+
+if [ "$${#physical_ifaces[@]}" -gt 1 ]; then
+  # Not the expected shape. Rather than guess which NIC is primary -- a guess
+  # an nmstate document would bake in for the rest of this node's life -- log
+  # loudly and leave every interface exactly as NetworkManager's own defaults
+  # already have it. A wrong guess applied here is far harder to find later
+  # than a node that simply kept its default network config.
+  log "WARNING: found $${#physical_ifaces[@]} physical NICs ($${physical_ifaces[*]}), expected exactly 1 on evroc."
+  log "WARNING: taking no nmstate action -- leaving every interface as NetworkManager's own defaults configured it."
+  log "network configuration skipped (multi-NIC shape not handled by this script)"
+  exit 0
+fi
+
+iface=$${physical_ifaces[0]}
+log "single physical NIC $iface -- applying MTU/IPv6 policy directly, no nmstate document, no nmc invocation"
+
+ip link set dev "$iface" mtu ${vpc_mtu}
+log "set mtu ${vpc_mtu} on $iface directly via ip-link (bypassing NetworkManager, deliberately)"
+
+if [ -w "/proc/sys/net/ipv6/conf/$iface/disable_ipv6" ]; then
+  echo 1 > "/proc/sys/net/ipv6/conf/$iface/disable_ipv6"
+  log "disabled IPv6 on $iface via sysctl (bypassing NetworkManager, deliberately)"
+else
+  log "could not disable IPv6 on $iface via sysctl (not writable) -- leaving it as-is, not fatal"
+fi
+
+# Diagnostic only: RKE2 finds this address itself via the default route, and
+# nothing here writes it anywhere. Short wait in case DHCP is still in
+# flight. ${vpc_prefix} is the prefix-length this node's subnet is expected to
+# carry; it is only logged alongside the address actually held, never
+# validated or enforced -- there is no static-fallback path left in this
+# script that would need to enforce it (DNS and default route already come
+# from evroc's own DHCP, so there is nothing left here for a
+# dns_servers-style override to do).
+sleep 2
+log "$iface current address(es): $(ip -4 -o addr show dev "$iface" scope global 2>&1) (expected prefix-length ${vpc_prefix})"
+
+# A correctly configured NIC is not the same as a working one. A VM can come
+# up with its virtual network port unlit: every line above runs identically to
+# a working sibling, yet the interface stays NO-CARRIER with no address at
+# all. NetworkManager will not activate a profile on a link with no carrier,
+# so the node comes up entirely unreachable.
+#
+# Nothing here can fix that, and dying would only cost the shell needed to
+# diagnose it. But an unqualified "network configuration complete" on a node
+# that cannot reach anything sent one person hunting through this script for a
+# bug that was never in it, so say it plainly instead.
+carrier=""
+if [ -r "/sys/class/net/$iface/carrier" ]; then
+  # EINVAL on an administratively-down interface; absent carrier is not proof
+  # of a fault, only "0" is.
+  read -r carrier < "/sys/class/net/$iface/carrier" || true
+fi
+if [ "$carrier" = "0" ]; then
+  log "WARNING: interface $iface reports NO CARRIER -- its network port is not up."
+  log "WARNING: the configuration above is correct and will activate by itself if the link ever comes up."
+  log "WARNING: until then this node cannot reach the cluster. This is a link-layer fault, not a"
+  log "WARNING: configuration one -- check the VM's network attachment on evroc."
+fi
+
+log "network configuration complete (hostname is set separately, via Ignition user_data)"
