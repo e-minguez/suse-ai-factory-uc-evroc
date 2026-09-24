@@ -24,6 +24,8 @@ module "ai_factory" {
   suse_registration_code     = var.suse_registration_code
   suse_registry_password     = var.suse_registry_password
   nvidia_api_key             = var.nvidia_api_key
+  gpu_driver_repository      = var.gpu_driver_repository
+  gpu_driver_version         = var.gpu_driver_version
   components                 = var.components
   rancher_hostname           = var.rancher_hostname
   rancher_bootstrap_password = var.rancher_bootstrap_password

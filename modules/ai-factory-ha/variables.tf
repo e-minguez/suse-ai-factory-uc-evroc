@@ -192,10 +192,24 @@ variable "nvidia_api_key" {
   description = "NVIDIA NGC API key, written into aif-operator.yaml's credentials.nvidia.password. Optional: when null, the whole nvidia: credentials block is omitted from aif-operator.yaml rather than written with an empty password. The paired username, when the block is present, is always the literal string \"$oauthtoken\" -- NGC's own convention, not a secret -- so it is hardcoded in the template rather than exposed as a variable."
 }
 
+variable "gpu_driver_repository" {
+  type        = string
+  nullable    = false
+  default     = "registry.opensuse.org/home/eminguez/branches/home/avicenzi/nvidia-for-bci-161/containerfile/third-party/nvidia"
+  description = "Registry path the GPU operator pulls its precompiled driver container from, written into gpu-operator.yaml's driver.repository. The operator appends /driver:<gpu_driver_version>-<uname -r>-sles16.1, so this must carry a tag for the nodes' exact kernel. The default is an EXPERIMENTAL OBS build for SLES 16.1: the release manifest's own registry.suse.com/third-party/nvidia only publishes 16.0 drivers, which do not load on the 16.1 kernel. Switch back to registry.suse.com/third-party/nvidia once it carries 16.1 tags. Changing this changes gpu-operator.yaml, which is in local.elemental_files and therefore rebuilds the image."
+}
+
+variable "gpu_driver_version" {
+  type        = string
+  nullable    = false
+  default     = "615"
+  description = "NVIDIA driver branch for the precompiled driver container, written into gpu-operator.yaml's driver.version. Must exist under gpu_driver_repository for the nodes' kernel."
+}
+
 variable "components" {
   type        = list(string)
   default     = ["rancher", "gpu-operator", "local-path-provisioner", "aif-operator"]
-  description = "Which SUSE AI Factory Helm charts release.yaml enables. Rendered in a fixed CANONICAL order -- cert-manager, rancher, gpu-operator, local-path-provisioner | suse-storage, aif-operator -- never the order given here (see locals.tf's component_spec/enabled_components); that is what makes this default list render release.yaml byte-for-byte identical to what this module shipped before this variable existed, so upgrading the module alone does not force an image rebuild. `cert-manager` is accepted here but never required as an explicit entry -- it is injected automatically whenever `rancher` is selected, because elemental's own dependency resolution (`internal/config/helm.go`'s `enabledHelmCharts`/`addChart`) already walks the AIF manifest's `rancher -> cert-manager` and `aif-operator -> rancher` `dependsOn` edges and inserts a dependency before its dependent -- naming it here too would only risk contradicting that. `suse-storage` (Longhorn) needs no `components.systemd` entry either: its chart declares a sysext `dependsOn` and elemental's `internal/config/systemd_sysext.go` (`enabledExtensions`/`isDependency`) auto-enables the extension the manifest already ships for it. Changing this list changes release.yaml, which is in local.elemental_files and therefore rebuilds the image and replaces every node -- inherent, since the chart set is baked into the image. Not validated, deliberately: `gpu-operator` against the presence of a GPU pool -- either order is a legitimate intermediate state (pools provisioned before the operator while GPU stock is chased, or the operator enabled before any pool exists)."
+  description = "Which SUSE AI Factory Helm charts release.yaml enables. Rendered in a fixed CANONICAL order -- cert-manager, rancher, gpu-operator, local-path-provisioner | suse-storage, aif-operator -- never the order given here (see locals.tf's component_spec/enabled_components); release.yaml depends only on which components are selected, so reordering this list does not force an image rebuild. `cert-manager` is accepted here but never required as an explicit entry -- it is injected automatically whenever `rancher` is selected, because elemental's own dependency resolution (`internal/config/helm.go`'s `enabledHelmCharts`/`addChart`) already walks the AIF manifest's `rancher -> cert-manager` and `aif-operator -> rancher` `dependsOn` edges and inserts a dependency before its dependent -- naming it here too would only risk contradicting that. `suse-storage` (Longhorn) needs no `components.systemd` entry either: its chart declares a sysext `dependsOn` and elemental's `internal/config/systemd_sysext.go` (`enabledExtensions`/`isDependency`) auto-enables the extension the manifest already ships for it. Changing this list changes release.yaml, which is in local.elemental_files and therefore rebuilds the image and replaces every node -- inherent, since the chart set is baked into the image. Not validated, deliberately: `gpu-operator` against the presence of a GPU pool -- either order is a legitimate intermediate state (pools provisioned before the operator while GPU stock is chased, or the operator enabled before any pool exists)."
 
   validation {
     condition = alltrue([
@@ -582,9 +596,9 @@ variable "retain_image_target_disks" {
     still creates disks (verified 2026-09-22 -- PLATFORM-NOTES.md). What has
     never been tested is BOOTING one of those disks: the probe disk was created
     and never started, and no node has been built from a snapshot whose source
-    was already gone. 96 GB a cluster is a cheap hedge against that gap, so
-    this defaults to true and examples/ha-cluster/deploy.sh reclaims only under
-    --reclaim-build-disks.
+    was already gone. The module defaults to true because flipping it in the
+    wrong apply races (below); examples/ha-cluster/deploy.sh, which sequences
+    it safely, reclaims by default unless --keep-build-disks is passed.
 
     Verify it if the storage matters: reclaim, then build one node from the
     snapshot and watch it boot. That single test is what would let this default

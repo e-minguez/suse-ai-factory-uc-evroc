@@ -82,24 +82,21 @@ Usage: ./deploy.sh [--rebuild] [--reclaim-build-disks|--keep-build-disks] [--yes
               recovering image_target_disk_gb per zone (96 GB on a default
               three-zone cluster) of billed storage.
 
-              OFF BY DEFAULT, on an untested dependency. A snapshot does
-              survive its source disk being deleted -- it stays Ready, keeps
-              reporting a restore_size and still creates disks (verified
-              2026-09-22, PLATFORM-NOTES.md). What nobody has tested is BOOTING
-              one of those disks: the probe disk was created and never started.
-              Those snapshots are the only remaining copy of the cluster's
-              image, so 96 GB is the cheaper side of that bet.
-
-              Pass this if the storage matters more than the hedge -- and if
-              you do, build one node from the snapshot afterwards and confirm
-              it boots.
+              ON BY DEFAULT. A snapshot survives its source disk being deleted
+              -- it stays Ready, keeps reporting a restore_size and still
+              creates disks (verified 2026-09-22, PLATFORM-NOTES.md). What
+              nobody has tested is BOOTING one of those disks: the first thing
+              to exercise it is a scale-out or node replacement after the
+              reclaim. Build one node from the snapshot afterwards and confirm
+              it boots if that matters. The flag itself only exists to revoke
+              a sticky --keep-build-disks.
+  --keep-build-disks
+              Keep the image-target disks as a hedge (and as forensics media --
+              they hold the exact bytes the snapshots were taken from).
 
               STICKY. Once asked for, it is re-asserted on every later run from
               pass2.auto.tfvars.json, so a plain ./deploy.sh does not quietly
-              re-create the disks you just paid to delete.
-  --keep-build-disks
-              Revoke a sticky --reclaim-build-disks: stop asserting it, and let
-              the image-target disks be re-created on this apply.
+              delete them. --reclaim-build-disks revokes it.
   --yes       Pass -auto-approve to both terraform apply passes.
   --help      Show this message.
   --          Stop parsing this script's flags; forward the rest verbatim.
@@ -111,20 +108,21 @@ USAGE
 }
 
 REBUILD=false
-# OFF by default, matching the module variable. The sequencing this script does
-# (never create a snapshot and destroy its source in one apply) is real but
-# separate; the reason for the default is that no node has been booted from a
-# clone taken after the source disk was deleted. See reclaim_build_disks.
-RECLAIM=false
-# Revokes a RECLAIM recovered from pass2.auto.tfvars.json below. Separate from
-# "RECLAIM=false", which is merely the absence of a request.
+# ON by default, unlike the module variable (which stays true so a hand-driven
+# two-pass apply cannot race a snapshot against its source). This script does
+# the sequencing that makes it safe: the reclaim is a pass of its own, after the
+# snapshots exist. See reclaim_build_disks.
+RECLAIM=true
+# Explicit requests, as opposed to the default. EXPLICIT_RECLAIM revokes a
+# KEEP_BUILD_DISKS recovered from pass2.auto.tfvars.json below.
+EXPLICIT_RECLAIM=false
 KEEP_BUILD_DISKS=false
 TF_ARGS=()
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --rebuild) REBUILD=true; shift ;;
-    --reclaim-build-disks) RECLAIM=true; shift ;;
+    --reclaim-build-disks) EXPLICIT_RECLAIM=true; shift ;;
     --keep-build-disks) KEEP_BUILD_DISKS=true; shift ;;
     --yes) TF_ARGS+=(-auto-approve); shift ;;
     --help | -h)
@@ -146,12 +144,10 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-# RECLAIM can only be true here if the flag was passed -- the sticky recovery
-# below has not run yet -- so this catches the contradiction and nothing else.
-if [[ "$RECLAIM" == true && "$KEEP_BUILD_DISKS" == true ]]; then
+if [[ "$EXPLICIT_RECLAIM" == true && "$KEEP_BUILD_DISKS" == true ]]; then
   echo "ERROR: --reclaim-build-disks and --keep-build-disks contradict each other." >&2
-  echo "       Pass exactly one: the first deletes the image-target disks, the second" >&2
-  echo "       revokes a reclaim asked for on an earlier run." >&2
+  echo "       Pass exactly one: the first deletes the image-target disks (the default," >&2
+  echo "       and revokes an earlier --keep-build-disks), the second keeps them." >&2
   exit 2
 fi
 
@@ -174,33 +170,31 @@ fi
 echo "==> terraform init"
 terraform init -input=false
 
-# A reclaim already asked for on some EARLIER run STAYS asked for, unless
-# --keep-build-disks revokes it.
+# A --keep-build-disks asked for on some EARLIER run STAYS asked for, unless
+# --reclaim-build-disks revokes it.
 #
 # pin_image_ready rewrites pass2.auto.tfvars.json from scratch every run, so
-# without this a reclaim done once and then a plain ./deploy.sh would drop the
-# key, let var.retain_image_target_disks fall back to its `true` default, and
-# silently re-create one blank image_target disk per zone -- 96 GB billed again
-# on a run the operator expected to change nothing. Harmless to the cluster
-# (snapshot.tf's disk_ref fallback reproduces the identical fqid, so no
-# snapshot is replaced), but it quietly undoes what was asked for.
+# without this a keep asked for once and then a plain ./deploy.sh would fall
+# back to the reclaim default and delete the disks the operator chose to keep.
+# The keep is recorded as an explicit `"retain_image_target_disks": true` --
+# never written otherwise -- so its presence is unambiguous.
 #
-# The intent is recovered into RECLAIM and not into PIN_RECLAIM, which matters:
-# RECLAIM routes through reclaim_build_disks below, i.e. a pass of its OWN
-# after pass 2. Seeding PIN_RECLAIM directly would instead make a --rebuild's
-# pass 2 create each snapshot and delete its source disk in one apply -- the
-# race the third pass exists to avoid.
+# A reclaim needs no recovery: it is the default, so every run re-asserts it
+# anyway, and always through reclaim_build_disks below, i.e. a pass of its OWN
+# after pass 2. That is what keeps a --rebuild's pass 2 from creating each
+# snapshot and deleting its source disk in one apply.
 if [[ "$KEEP_BUILD_DISKS" == true ]]; then
   RECLAIM=false
-elif [[ -f pass2.auto.tfvars.json ]] && python3 -c '
+elif [[ "$EXPLICIT_RECLAIM" == false && -f pass2.auto.tfvars.json ]] && python3 -c '
 import json, sys
 try:
     pinned = json.load(open("pass2.auto.tfvars.json")).get("retain_image_target_disks")
 except Exception:
     sys.exit(1)
-sys.exit(0 if pinned is False else 1)
+sys.exit(0 if pinned is True else 1)
 ' 2>/dev/null; then
-  RECLAIM=true
+  RECLAIM=false
+  KEEP_BUILD_DISKS=true
 fi
 
 # Whether the file pin_image_ready writes should also reclaim the image_target
@@ -211,6 +205,11 @@ pin_image_ready() {
   if [[ "$PIN_RECLAIM" == true ]]; then
     printf '{\n  "image_ready": true,\n  "retain_image_target_disks": false\n}\n' \
       > pass2.auto.tfvars.json
+  elif [[ "$KEEP_BUILD_DISKS" == true ]]; then
+    # Explicit rather than omitted, so the sticky recovery above can tell a
+    # deliberate keep from a pass 2 whose pass 3 has not run yet.
+    printf '{\n  "image_ready": true,\n  "retain_image_target_disks": true\n}\n' \
+      > pass2.auto.tfvars.json
   else
     printf '{\n  "image_ready": true\n}\n' > pass2.auto.tfvars.json
   fi
@@ -218,15 +217,15 @@ pin_image_ready() {
 
 # Delete the image_target disks, recovering image_target_disk_gb per zone --
 # 96 GB on a default three-zone cluster, billed until something deletes it.
-# OFF by default; --reclaim-build-disks opts in.
+# ON by default; --keep-build-disks opts out.
 #
-# WHY IT IS OFF. Deleting a source disk leaves its snapshot Ready and still
+# THE KNOWN GAP. Deleting a source disk leaves its snapshot Ready and still
 # able to create disks -- that much was verified on 2026-09-22. What was not
 # verified is BOOTING one of those disks; the probe was created and never
 # started. After a reclaim the snapshots are the only copy of the cluster's
 # image, and the first thing that would exercise the gap is a scale-out or a
-# node replacement, possibly weeks later. 96 GB is the cheaper side of the bet
-# until someone runs the test.
+# node replacement, possibly weeks later. Pass 2's nodes do not test it: they
+# are cloned before this pass runs.
 #
 # A THIRD APPLY, DELIBERATELY, when it is asked for. The disks are the source
 # the snapshots are taken FROM. Ask one apply to create a snapshot and destroy
@@ -395,7 +394,7 @@ echo "==> Pass 2: detach the image-build disk, snapshot it, and flip image_ready
 pin_image_ready
 apply_with_retry "Pass 2"
 
-# A no-op unless --reclaim-build-disks was passed. Separate from pass 2 on purpose.
+# A no-op under --keep-build-disks. Separate from pass 2 on purpose.
 reclaim_build_disks
 
 echo "==> Done. See outputs for jumphost_public_ipv4, kubernetes_api_endpoint, api_vip and rancher_url."

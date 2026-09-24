@@ -28,29 +28,27 @@ costs an immutable EFI-only image — the experimental UEFI label, why the image
 build takes two passes, the GPU placement and quota rules, and the handful of platform behaviours this module
 currently assumes rather than knows.
 
-## Known limitation: no NVIDIA driver for SLES 16.1 yet (as of 2026-09-23)
+## Experimental NVIDIA driver for SLES 16.1 (as of 2026-09-24)
 
-GPU nodes provision and join the cluster, but the GPU operator cannot install
-a driver on them, so they expose no `nvidia.com/gpu` capacity and GPU workloads
-do not schedule.
+The GPU operator uses an **experimental** precompiled driver: branch `615`
+from an OBS build,
+`registry.opensuse.org/home/eminguez/branches/home/avicenzi/nvidia-for-bci-161/containerfile/third-party/nvidia`.
+It is not a supported SUSE image. It does work: on a `gn-l40s` node the driver
+pod loads, the CUDA validator passes and `nvidia-smi` reports the L40S.
 
 The nodes run SLES 16.1 (kernel `6.12.0-160100.x`), which the module needs:
 `core_platform_override` pins the 16.1 OS image because the 16.0 one does not
 bring up Kubernetes (see the variable's description). The precompiled driver
-images at
-[`registry.suse.com/third-party/nvidia/driver`](https://registry.suse.com/repositories/third-party-nvidia-driver-sles16)
-are published for SLES 16.0 only, so the driver pod fails with
-`ImagePullBackOff` on a tag such as `610-6.12.0-160100.5-default-sles16.1`.
+images the release manifest points at,
+[`registry.suse.com/third-party/nvidia/driver`](https://registry.suse.com/repositories/third-party-nvidia-driver-sles16),
+are published for SLES 16.0 only. A 16.0 module does not load on a 16.1 node
+(`nvidia: disagrees about version of symbol module_layout`), because the
+kernel's module ABI changed between the two.
 
-A 16.0 image cannot stand in for it. Loading a 16.0 module on a 16.1 node fails
-with `nvidia: disagrees about version of symbol module_layout`: the kernel's
-module ABI changed between the two, so retagging or pinning an older driver
-branch does not help.
-
-This resolves once SLES 16.1 driver images are published; no change to the
-module should be needed. Until then, the options are building the driver
-container for the 16.1 kernel yourself, or leaving `gpu-operator` out of
-`components`.
+The operator pulls `<repository>/driver:<version>-<uname -r>-sles16.1`, so the
+OBS repository needs a tag for the node's exact kernel. Once
+`registry.suse.com/third-party/nvidia` publishes 16.1 drivers, set
+`gpu_driver_repository` and `gpu_driver_version` back to it.
 
 ## Usage
 
@@ -88,10 +86,10 @@ platform is to write it onto a disk that is already there:
    snapshot. The build hosts go first because a default project's 20 vCPU does
    not hold them and the nodes at once.
 
-A third, short apply can delete the image-target disks, but it is **off by
-default** and `--reclaim-build-disks` is the only way to ask for it: a snapshot
-outlives its source disk, but no node has yet been booted from a clone taken
-after that disk was deleted. See PLATFORM-NOTES.md.
+A third, short apply deletes the image-target disks. It is **on by default** in
+`deploy.sh`; `--keep-build-disks` opts out. A snapshot outlives its source disk,
+but no node has yet been booted from a clone taken after that disk was deleted.
+See PLATFORM-NOTES.md.
 
 Terraform owns the detach and the snapshot, so no build host ever holds evroc
 credentials. `deploy.sh` drives the passes and pins `image_ready` in

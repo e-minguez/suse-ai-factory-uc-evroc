@@ -111,18 +111,18 @@ than racing them. The jumphost survives -- it stays the bastion. One
 consequence worth knowing before you start pass 2: from this point the build
 logs are gone, so a failure here is recovered with `--rebuild`, not a retry.
 
-After pass 2 there is an optional short **pass 3**, which deletes the
-image-target disks and reclaims `image_target_disk_gb` a zone -- 96 GB on a
-three-zone cluster. It runs only under `--reclaim-build-disks`.
+After pass 2 there is a short **pass 3**, which deletes the image-target disks
+and reclaims `image_target_disk_gb` a zone -- 96 GB on a three-zone cluster. It
+runs by default; `--keep-build-disks` skips it.
 A snapshot does outlive its source disk -- it stays Ready and still creates
 disks -- but nothing has yet booted a disk cloned from a snapshot whose source
-was already deleted, and the cluster's whole image lives in those snapshots.
-Keeping 96 GB is the cheaper side of that bet until someone tests it.
+was already deleted, and after pass 3 the cluster's whole image lives in those
+snapshots. Keep the disks if you want that hedge, or as forensics media.
 
-The flag is **sticky**: `deploy.sh` re-asserts it on every later run by reading
-`pass2.auto.tfvars.json` back, because that file is rewritten from scratch each
-time and a dropped key would silently re-create the disks you just paid to
-delete. `--keep-build-disks` revokes it.
+`--keep-build-disks` is **sticky**: `deploy.sh` re-asserts it on every later run
+by reading `pass2.auto.tfvars.json` back, because that file is rewritten from
+scratch each time and a dropped key would silently delete the disks you chose to
+keep. `--reclaim-build-disks` revokes it.
 
 `deploy.sh --rebuild` forces a fresh build on a cluster that already has a
 snapshot in state (an edit under `modules/ai-factory-ha/templates/`, for
@@ -188,7 +188,8 @@ replaces every node.** Run `./deploy.sh --rebuild` afterward. Variables that do 
 `elemental_image`, `root_password_hash`, `ssh_authorized_keys`,
 `node_username`, `node_user_password_hash`, `permit_root_ssh`, `components`,
 `aif_version` / `aif_release_manifest_url`, `core_platform_override`,
-`sysext_image_overrides`, `image_disk_size`, `fips`. Everything else --
+`sysext_image_overrides`, `gpu_driver_repository` / `gpu_driver_version`,
+`image_disk_size`, `fips`. Everything else --
 sizing (`control_plane_flavor`, `jumphost_flavor`, `node_disk_gb`,
 `gpu_pools`), networking (`vpc_cidr`, `subnet_newbits`, `vpc_mtu`), placement
 (`zones`, `gpu_pools[*].zone`, `gpu_pools[*].placement_strategy`), and access

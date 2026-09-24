@@ -98,6 +98,22 @@ variable "nvidia_api_key" {
   description = "NVIDIA NGC API key. null omits the nvidia: credentials block entirely."
 }
 
+# Leave both at null until SUSE publishes SLES 16.1 precompiled drivers under
+# registry.suse.com/third-party/nvidia. null takes the module's default: an
+# experimental OBS build of branch 615, the only driver known to load on these
+# nodes' 16.1 kernel. See the top-level README.
+variable "gpu_driver_repository" {
+  type        = string
+  default     = null
+  description = "GPU operator driver.repository. Do not change until a supported SLES 16.1 driver is released; null uses the module's experimental default."
+}
+
+variable "gpu_driver_version" {
+  type        = string
+  default     = null
+  description = "GPU operator driver.version. Do not change until a supported SLES 16.1 driver is released; null uses the module's default (615)."
+}
+
 variable "components" {
   type        = list(string)
   default     = ["rancher", "gpu-operator", "local-path-provisioner", "aif-operator"]

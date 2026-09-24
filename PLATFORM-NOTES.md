@@ -70,7 +70,7 @@ detach it, hotswap it onto the jumphost, and read the ESP and the root
 filesystem from there. The `image_target` disks hold the same bytes the
 snapshots were taken from and are already detached, which makes them the
 cheapest thing to look at — but `deploy.sh` reclaims them once the snapshots
-exist, so they are kept by default (`--reclaim-build-disks` is what deletes them, and it should stay unused).
+exist unless it is run with `--keep-build-disks`.
 
 ```bash
 evroc compute hotswapdiskattachment create forensics-a \
@@ -226,7 +226,7 @@ every other flavor:
 | `gn-b200` | `.s`, `.m`, `.l`, `.xl` | NVIDIA B200 |
 
 They are `evroc_virtual_machine` like everything else. That has one large
-security consequence and one open question.
+security consequence.
 
 The consequence: **security groups apply to GPU nodes**. There is no bare-metal
 tier that the platform's packet filter cannot reach, so every node in this
@@ -234,8 +234,23 @@ module — control plane, GPU worker, jumphost — sits behind an
 `evroc_security_group` with a default-deny inbound posture. The module does not
 depend on host-level firewalling inside the image for its network policy.
 
-The open question is the driver path. The NVIDIA GPU Operator on an immutable OS
-only works with **precompiled** driver containers:
+The NVIDIA GPU Operator on an immutable OS only works with **precompiled**
+driver containers. NVIDIA's documentation states that precompiled driver
+containers do not support vGPU, and the vGPU guest-driver path needs DKMS
+rebuilding the module on every kernel change plus `nvidia-gridd.service`
+holding a licence — none of which an immutable root can do. So GPU support here
+requires **passthrough**.
+
+**Confirmed (2026-09-24): `gn-l40s` presents a full passthrough device**, not a
+vGPU function:
+
+```
+0a:00.0 3D controller: NVIDIA Corporation AD102GL [L40S] (rev a1)
+```
+
+`nvidia-smi` on the same node reports the whole card (46068 MiB).
+
+The release manifest's driver source does not work on these nodes:
 
 ```yaml
 driver:
@@ -244,24 +259,17 @@ driver:
   version: 595
 ```
 
-NVIDIA's documentation states that precompiled driver containers do not support
-vGPU, and the vGPU guest-driver path needs DKMS rebuilding the module on every
-kernel change plus `nvidia-gridd.service` holding a licence — none of which an
-immutable root can do. So GPU support here requires **passthrough**.
-
-**Unverified:** whether `gn-*` profiles present a passthrough device or a vGPU
-function. Check on a booted node:
-
-```bash
-lspci -nn | grep -i nvidia    # a full device, not a vGPU function
-nvidia-smi -q | head -40
-```
+That registry publishes SLES 16.0 builds only, and a 16.0 module does not load
+on the 16.1 kernel (`nvidia: disagrees about version of symbol module_layout`).
+The module overrides it through `gpu_driver_repository`/`gpu_driver_version`,
+defaulting to an experimental OBS 16.1 build of branch `615`. With it, the
+driver daemonset, CUDA validator and device plugin all come up. See the
+top-level README.
 
 `data.evroc_disk_images` exposes a `gpu_affinities` list per stock image, which
-suggests the platform tracks which images may run on which GPU flavors. Whether
-a **custom snapshot** carries any affinity — and so whether it can boot on a
-`gn-*` flavor at all — is the second thing to confirm. Both are cheap to test
-and both are blocking for GPU pools; neither blocks the control plane.
+suggests the platform tracks which images may run on which GPU flavors. A
+**custom snapshot** boots on a `gn-l40s` flavor regardless: the same deployment
+booted its GPU worker from this module's snapshot and it joined the cluster.
 
 ### GPU VMs run in zone "a" only (2026-09-22)
 
@@ -703,9 +711,10 @@ succeeded.
 
 **What is still not verified is booting such a clone.** `probe-c` was created
 and never started, and no node has yet been built from a snapshot whose source
-disk was already gone. So `var.retain_image_target_disks` defaults to `true` and
-`deploy.sh` reclaims only under `--reclaim-build-disks`: 96 GB a cluster is a
-cheap hedge against an untested dependency, not a response to a known failure.
+disk was already gone. `var.retain_image_target_disks` still defaults to `true`
+(see the race below), but `deploy.sh` reclaims by default in a pass of its own;
+`--keep-build-disks` keeps the 96 GB as a hedge against that untested
+dependency.
 If you do reclaim, do it in **an apply of its own, after** pass 2 — creating a
 snapshot and destroying the disk it is taken from in one apply depends on an
 ordering Terraform's graph does not pin down, and losing that race leaves the
