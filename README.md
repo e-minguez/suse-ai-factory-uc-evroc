@@ -88,10 +88,10 @@ platform is to write it onto a disk that is already there:
    snapshot. The build hosts go first because a default project's 20 vCPU does
    not hold them and the nodes at once.
 
-A third, short apply can delete the image-target disks, but it is **off by
-default** and `--reclaim-build-disks` is the only way to ask for it: a snapshot
-outlives its source disk, but no node has yet been booted from a clone taken
-after that disk was deleted. See PLATFORM-NOTES.md.
+A third, short apply deletes the image-target disks. It is **on by default** in
+`deploy.sh`; `--keep-build-disks` opts out. A snapshot outlives its source disk,
+but no node has yet been booted from a clone taken after that disk was deleted.
+See PLATFORM-NOTES.md.
 
 Terraform owns the detach and the snapshot, so no build host ever holds evroc
 credentials. `deploy.sh` drives the passes and pins `image_ready` in

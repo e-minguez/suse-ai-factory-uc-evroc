@@ -70,7 +70,7 @@ detach it, hotswap it onto the jumphost, and read the ESP and the root
 filesystem from there. The `image_target` disks hold the same bytes the
 snapshots were taken from and are already detached, which makes them the
 cheapest thing to look at — but `deploy.sh` reclaims them once the snapshots
-exist, so they are kept by default (`--reclaim-build-disks` is what deletes them, and it should stay unused).
+exist unless it is run with `--keep-build-disks`.
 
 ```bash
 evroc compute hotswapdiskattachment create forensics-a \
@@ -703,9 +703,10 @@ succeeded.
 
 **What is still not verified is booting such a clone.** `probe-c` was created
 and never started, and no node has yet been built from a snapshot whose source
-disk was already gone. So `var.retain_image_target_disks` defaults to `true` and
-`deploy.sh` reclaims only under `--reclaim-build-disks`: 96 GB a cluster is a
-cheap hedge against an untested dependency, not a response to a known failure.
+disk was already gone. `var.retain_image_target_disks` still defaults to `true`
+(see the race below), but `deploy.sh` reclaims by default in a pass of its own;
+`--keep-build-disks` keeps the 96 GB as a hedge against that untested
+dependency.
 If you do reclaim, do it in **an apply of its own, after** pass 2 — creating a
 snapshot and destroying the disk it is taken from in one apply depends on an
 ordering Terraform's graph does not pin down, and losing that race leaves the

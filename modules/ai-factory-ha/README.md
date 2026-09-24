@@ -32,12 +32,12 @@ Note that `backend_network` forces replacement, so changing `var.vpc_cidr` or
 `var.zones` rebuilds the load balancer.
 
 There is an optional third apply that reclaims the image-target disks
-(`retain_image_target_disks = false`, `deploy.sh --reclaim-build-disks`). Both
-default to keeping them: a snapshot does survive its source disk, but no node
-has yet been booted from a clone made after that disk was deleted, and 32 GB a
-zone is cheaper than finding out during a scale-out. It also has to be a
-separate apply -- creating a snapshot and destroying its source in the same one
-races.
+(`retain_image_target_disks = false`). The module variable defaults to keeping
+them, because it has to be a separate apply -- creating a snapshot and
+destroying its source in the same one races. `deploy.sh` does that sequencing
+and reclaims by default (`--keep-build-disks` opts out). A snapshot does survive
+its source disk, but no node has yet been booted from a clone made after that
+disk was deleted.
 
 `examples/ha-cluster/deploy.sh` drives every pass and pins `image_ready` in an
 auto-loaded `pass2.auto.tfvars.json` so a later bare `terraform apply` does not
@@ -350,7 +350,7 @@ extension(s) not found".
 | `gpu_zones` | `["a"]` | Zones where evroc will run a GPU VM at all. Its `virtualmachine-webhook` rejects the others outright, per VM, at apply time, after that node's boot disk exists -- so the module keeps its own copy of the rule and refuses at plan instead. Widen it when evroc does. |
 | `jumphost_flavor` / `jumphost_disk_gb` | `a1a.m` / `200` | Applies to every build host, one per zone. The disk is the binding constraint -- room for the OCI layers and the raw file; the flavor is sized so three build hosts fit a default project's 20 vCPU quota. |
 | `image_target_disk_gb` | `32` | Validated `>=` the `raw.diskSize` in `image_disk_size`. |
-| `retain_image_target_disks` | `true` | Keep the image-target disks after the snapshots exist. `false` reclaims them. Kept by default as a hedge: a snapshot outlives its source disk and still creates disks, but no node has ever been booted from a clone taken after the source was deleted. `deploy.sh` reclaims only under `--reclaim-build-disks`. |
+| `retain_image_target_disks` | `true` | Keep the image-target disks after the snapshots exist. `false` reclaims them. Kept by default as a hedge: a snapshot outlives its source disk and still creates disks, but no node has ever been booted from a clone taken after the source was deleted. `deploy.sh` flips it in a pass of its own by default; `--keep-build-disks` opts out. |
 | `node_disk_gb` | `200` | Elemental expands the root on first boot. |
 | `image_disk_size` | `"8G"` | The raw image's own size. |
 

@@ -582,9 +582,9 @@ variable "retain_image_target_disks" {
     still creates disks (verified 2026-09-22 -- PLATFORM-NOTES.md). What has
     never been tested is BOOTING one of those disks: the probe disk was created
     and never started, and no node has been built from a snapshot whose source
-    was already gone. 96 GB a cluster is a cheap hedge against that gap, so
-    this defaults to true and examples/ha-cluster/deploy.sh reclaims only under
-    --reclaim-build-disks.
+    was already gone. The module defaults to true because flipping it in the
+    wrong apply races (below); examples/ha-cluster/deploy.sh, which sequences
+    it safely, reclaims by default unless --keep-build-disks is passed.
 
     Verify it if the storage matters: reclaim, then build one node from the
     snapshot and watch it boot. That single test is what would let this default
