@@ -188,7 +188,8 @@ replaces every node.** Run `./deploy.sh --rebuild` afterward. Variables that do 
 `elemental_image`, `root_password_hash`, `ssh_authorized_keys`,
 `node_username`, `node_user_password_hash`, `permit_root_ssh`, `components`,
 `aif_version` / `aif_release_manifest_url`, `core_platform_override`,
-`sysext_image_overrides`, `image_disk_size`, `fips`. Everything else --
+`sysext_image_overrides`, `gpu_driver_repository` / `gpu_driver_version`,
+`image_disk_size`, `fips`. Everything else --
 sizing (`control_plane_flavor`, `jumphost_flavor`, `node_disk_gb`,
 `gpu_pools`), networking (`vpc_cidr`, `subnet_newbits`, `vpc_mtu`), placement
 (`zones`, `gpu_pools[*].zone`, `gpu_pools[*].placement_strategy`), and access

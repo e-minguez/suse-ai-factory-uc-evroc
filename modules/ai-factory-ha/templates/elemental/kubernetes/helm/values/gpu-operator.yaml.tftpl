@@ -1,0 +1,17 @@
+# The release manifest already sets driver.repository/usePrecompiled/version
+# and cdi.nriPluginEnabled for this chart. elemental deep-merges this file OVER
+# those inline values (pkg/helm/values_resolver.go's mergeMaps, file wins), so
+# only the driver source is restated here; cdi is inherited untouched.
+#
+# The manifest's registry.suse.com/third-party/nvidia publishes SLES 16.0
+# precompiled drivers only, and a 16.0 module does not load on the 16.1 kernel
+# these nodes run. The default here is an experimental OBS build for 16.1 --
+# see the experimental driver section of the top-level README.
+#
+# The operator resolves the image as
+# <repository>/driver:<version>-<uname -r>-sles16.1, so the repository must
+# carry a tag for the node's exact kernel.
+driver:
+  repository: ${jsonencode(repository)}
+  usePrecompiled: true
+  version: ${jsonencode(version)}

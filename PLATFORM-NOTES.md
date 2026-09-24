@@ -226,7 +226,7 @@ every other flavor:
 | `gn-b200` | `.s`, `.m`, `.l`, `.xl` | NVIDIA B200 |
 
 They are `evroc_virtual_machine` like everything else. That has one large
-security consequence and one open question.
+security consequence.
 
 The consequence: **security groups apply to GPU nodes**. There is no bare-metal
 tier that the platform's packet filter cannot reach, so every node in this
@@ -234,8 +234,23 @@ module — control plane, GPU worker, jumphost — sits behind an
 `evroc_security_group` with a default-deny inbound posture. The module does not
 depend on host-level firewalling inside the image for its network policy.
 
-The open question is the driver path. The NVIDIA GPU Operator on an immutable OS
-only works with **precompiled** driver containers:
+The NVIDIA GPU Operator on an immutable OS only works with **precompiled**
+driver containers. NVIDIA's documentation states that precompiled driver
+containers do not support vGPU, and the vGPU guest-driver path needs DKMS
+rebuilding the module on every kernel change plus `nvidia-gridd.service`
+holding a licence — none of which an immutable root can do. So GPU support here
+requires **passthrough**.
+
+**Confirmed (2026-09-24): `gn-l40s` presents a full passthrough device**, not a
+vGPU function:
+
+```
+0a:00.0 3D controller: NVIDIA Corporation AD102GL [L40S] (rev a1)
+```
+
+`nvidia-smi` on the same node reports the whole card (46068 MiB).
+
+The release manifest's driver source does not work on these nodes:
 
 ```yaml
 driver:
@@ -244,24 +259,17 @@ driver:
   version: 595
 ```
 
-NVIDIA's documentation states that precompiled driver containers do not support
-vGPU, and the vGPU guest-driver path needs DKMS rebuilding the module on every
-kernel change plus `nvidia-gridd.service` holding a licence — none of which an
-immutable root can do. So GPU support here requires **passthrough**.
-
-**Unverified:** whether `gn-*` profiles present a passthrough device or a vGPU
-function. Check on a booted node:
-
-```bash
-lspci -nn | grep -i nvidia    # a full device, not a vGPU function
-nvidia-smi -q | head -40
-```
+That registry publishes SLES 16.0 builds only, and a 16.0 module does not load
+on the 16.1 kernel (`nvidia: disagrees about version of symbol module_layout`).
+The module overrides it through `gpu_driver_repository`/`gpu_driver_version`,
+defaulting to an experimental OBS 16.1 build of branch `615`. With it, the
+driver daemonset, CUDA validator and device plugin all come up. See the
+top-level README.
 
 `data.evroc_disk_images` exposes a `gpu_affinities` list per stock image, which
-suggests the platform tracks which images may run on which GPU flavors. Whether
-a **custom snapshot** carries any affinity — and so whether it can boot on a
-`gn-*` flavor at all — is the second thing to confirm. Both are cheap to test
-and both are blocking for GPU pools; neither blocks the control plane.
+suggests the platform tracks which images may run on which GPU flavors. A
+**custom snapshot** boots on a `gn-l40s` flavor regardless: the same deployment
+booted its GPU worker from this module's snapshot and it joined the cluster.
 
 ### GPU VMs run in zone "a" only (2026-09-22)
 

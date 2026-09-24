@@ -359,13 +359,14 @@ extension(s) not found".
 | Name | Default | Notes |
 |---|---|---|
 | `elemental_image` | `registry.suse.com/beta/uc/elemental:3.1.0-6.5` | The builder image. |
-| `components` | `["rancher", "gpu-operator", "local-path-provisioner", "aif-operator"]` | `cert-manager` is injected automatically when `rancher` is present. Rendered in a canonical order, not the given one, so the default renders byte-identically. |
+| `components` | `["rancher", "gpu-operator", "local-path-provisioner", "aif-operator"]` | `cert-manager` is injected automatically when `rancher` is present. Rendered in a canonical order, not the given one, so reordering the list does not rebuild the image. |
 | `aif_version` / `aif_release_manifest_url` | `2.2.0` / derived | The manifest body is fetched at **plan** time purely to hash into the build id, so `terraform plan` needs outbound access to it. |
 | `core_platform_override` | beta `base-os-kernel-default-iso:16.1-*` | Not null on purpose, and not safe to null out. AIF 2.2's manifest chain resolves to the GA 16.0 OS image, whose elemental3ctl silently ignores `initrdExtensions` and yields a node that boots fine with no Kubernetes and no error. A GA `base-os-kernel-default` path is rejected at plan time for the same reason. |
 | `sysext_image_overrides` | (map) | Keyed by extension name. A name this module never enables is rejected at plan time, and one the release manifest does not carry is fatal in the build script -- either is almost always a typo. Filtered to enabled extensions before hashing, so an override for a disabled extension does not renumber the build. |
 | `fips` | `false` | Sets `cryptoPolicy: fips`. |
 | `node_username` / `permit_root_ssh` | `suse` / `false` | |
 | `nvidia_api_key` | `null` | NGC key, for the GPU operator. |
+| `gpu_driver_repository` / `gpu_driver_version` | experimental OBS SLES 16.1 build / `615` | Overrides the manifest's `driver.repository`/`driver.version`. The operator pulls `<repo>/driver:<version>-<uname -r>-sles16.1`, so the repo needs a tag for the nodes' exact kernel. Revert to `registry.suse.com/third-party/nvidia` once it publishes 16.1 drivers. |
 | `ingress_controller` | `"traefik"` | `"none"` removes the 80/443 listeners, services and routes together. |
 | `rancher_hostname` / `rancher_bootstrap_password` | `null` / generated | Default hostname is `rancher-<api_vip>.sslip.io`. |
 
