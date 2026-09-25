@@ -1057,6 +1057,26 @@ time. `data.evroc_organization_quota` does expose it, though, and
 table above, computed from the flavors' `vcpus` and memory — exceeds the limit.
 GPU workers are left out of that sum, per the GPU section.
 
+### VMs cannot be IPv4-only (verified 2026-09-25)
+
+The provider's `evroc_virtual_machine.stack_type` documents `ipv4-only`, but
+the platform refuses it on create:
+
+```
+API error (403): IPv4OnlyStackTypeDeprecated - admission webhook
+"virtualmachine-webhook.evroc.com" denied the request: ipv4-only is deprecated
+and cannot be set on new VMs; use dual-stack or ipv6-only
+```
+
+Subnets and VPCs only offer `dual-stack` or `ipv6-only` too, so every VM gets
+an IPv6 address whether it wants one or not. The module leaves `stack_type`
+unset (inherits the subnet's `dual-stack`); inside the guest,
+configure-network.sh disables IPv6 on the NIC anyway. Tried as a guess at why
+a GPU VM sat at "Waiting for IPv6 Networking" -- that condition is more likely
+a symptom of the VM never being scheduled (`ErrorUnschedulable`, no L40S
+capacity) than a cause: control-plane VMs in the same subnet got their IPv6
+addresses and came up normally.
+
 ### Egress works without a public IP
 
 evroc's VPC docs: *"VMs can make outbound connections to the internet, and
