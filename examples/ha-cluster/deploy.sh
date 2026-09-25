@@ -290,7 +290,10 @@ apply_with_retry() {
     rc=0
     # tee, so the operator still sees the apply stream live -- and stdin is
     # left alone, so an interactive (no --yes) approval prompt still works.
-    terraform apply ${TF_ARGS[@]+"${TF_ARGS[@]}"} 2>&1 | tee "$log" || rc=$?
+    # tee -i: Ctrl-C reaches the whole pipeline, and a tee that dies with it
+    # takes the errors Terraform prints while stopping -- including those of
+    # creates that failed earlier in the run -- down with it.
+    terraform apply ${TF_ARGS[@]+"${TF_ARGS[@]}"} 2>&1 | tee -i "$log" || rc=$?
 
     if [[ $rc -eq 0 ]]; then
       return 0
