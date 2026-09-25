@@ -239,10 +239,28 @@ step 5 "running elemental customize against ${config_dir}"
 # --security-opt label=disable: SELinux-enforcing build hosts default to
 # denying the container the broad device/filesystem access it needs to build a
 # raw disk image.
-podman run --rm \
-  --security-opt label=disable \
-  -v "${config_dir}:/config" \
-  "${elemental_image}" customize --type raw
+#
+# Retried: customize pulls several OCI images mid-run (the base ISO alone is
+# ~200 MB), and one registry hiccup -- registry.suse.com has been seen to send
+# an http2 GOAWAY/INTERNAL_ERROR partway through the ISO -- would otherwise
+# fail the zone and with it the whole deploy. Each attempt starts from a clean
+# slate: a partial raw from the failed one would otherwise be what step 6's
+# `ls -t` picks up.
+CUSTOMIZE_ATTEMPTS=3
+for ((ATTEMPT = 1; ; ATTEMPT++)); do
+  rm -f "${config_dir}"/image-*.raw
+  podman run --rm \
+    --security-opt label=disable \
+    -v "${config_dir}:/config" \
+    "${elemental_image}" customize --type raw && break
+  if ((ATTEMPT >= CUSTOMIZE_ATTEMPTS)); then
+    log "ERROR: elemental customize failed $CUSTOMIZE_ATTEMPTS times, giving up"
+    exit 1
+  fi
+  log "elemental customize failed (attempt $ATTEMPT/$CUSTOMIZE_ATTEMPTS), retrying in 60s"
+  publish building "step 5/9: elemental customize failed, retrying (attempt $((ATTEMPT + 1))/$CUSTOMIZE_ATTEMPTS)" || true
+  sleep 60
+done
 
 step 6 "locating produced raw image"
 RAW_IMAGE=$(ls -t "${config_dir}"/image-*.raw 2>/dev/null | head -n1 || true)
