@@ -1103,5 +1103,5 @@ variable "status_relay_port" {
 variable "verify_flavor_availability" {
   type        = bool
   default     = true
-  description = "Whether to run pre-flight checks, during plan, that the chosen compute profiles (control_plane_flavor, jumphost_flavor, every gpu_pools flavor) are actually offered by evroc right now -- see availability.tf. Best-effort: availability can still change between plan and apply."
+  description = "Whether to run pre-flight checks, during plan, that the chosen compute profiles (control_plane_flavor, jumphost_flavor, every gpu_pools flavor) are actually offered by evroc right now, and that the cluster's peak vCPU, memory and public-IP demand fits the organization quota -- see availability.tf. Best-effort: availability can still change between plan and apply, and the quota check ignores what else is already running."
 }

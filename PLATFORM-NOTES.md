@@ -328,9 +328,9 @@ Those GPU vCPUs are **not** drawn from the ordinary compute quota — a
 allowance, for a total of 31, and the request was not denied.
 
 The quota itself cannot be checked at plan time. `data.evroc_compute_profiles`
-reports which profiles *exist*, not what the project may run, and the only quota
-data sources the provider ships — `evroc_project_quota` and
-`evroc_organization_quota` — expose object storage totals and nothing else. But
+reports which profiles *exist*, not what the project may run, and neither quota
+data source has a GPU counter (`evroc_organization_quota` covers vCPU, memory,
+public IPs, load balancers and block storage — see the public-IP section). But
 the *demand* side is plan-time knowable, because that same data source's
 `details[]` carries `gpu_quantity` and `gpu_model` per profile: the module
 multiplies it out into the `gpu_quota_request` output, so `terraform plan`
@@ -930,10 +930,19 @@ apply, creates whichever IPs fit, and errors on the rest. The nodes whose IPs
 failed are simply not created, and state is left holding the ones that
 succeeded.
 
-`data.evroc_project_quota` exists but exposes only object-storage counters
-(`object_storage_total_size`, `object_storage_usage`) — there is nothing for
-public IPs, so the module cannot check this at plan time. On a default project,
-set both toggles false:
+`data.evroc_project_quota` exposes only object-storage counters, but
+**`data.evroc_organization_quota` carries the rest** (read 2026-09-25):
+`compute_vcpus` / `usage_vcpus`, `compute_memory` / `usage_memory` (strings,
+`"160GB"`), `networking_public_ips` / `usage_public_ips`,
+`load_balancer_count`, `compute_block_storage`. On a single default project the
+org limits equal the project defaults above (20 vCPU, 160 GB, 3 IPs).
+availability.tf's `terraform_data.quota_check` now fails the **plan** when the
+cluster's own peak demand exceeds those limits, so `control_plane_public_ip =
+true` on a default quota stops at plan time instead of partway through an
+apply. It does not compare against limit − usage: usage includes the cluster's
+own existing resources and nothing at plan time says which, so every plan of a
+deployed cluster would warn. The `quota_request` output shows demand, limit and
+usage side by side instead. On a default project, set both toggles false:
 
 ```hcl
 control_plane_public_ip = false
@@ -1042,8 +1051,11 @@ The resulting budget, on the default three zones and three control planes:
 That leaves 4 vCPU. A GPU pool does not fit in it — `gn-*` profiles need their
 own quota increase, and so does any larger control-plane flavor.
 
-Like the public-IP quota, this is an admission webhook at create time, not a
-plan-time check, and `data.evroc_project_quota` exposes nothing about it.
+Like the public-IP quota, this is enforced by an admission webhook at create
+time. `data.evroc_organization_quota` does expose it, though, and
+`terraform_data.quota_check` fails the plan when the peak of either pass — the
+table above, computed from the flavors' `vcpus` and memory — exceeds the limit.
+GPU workers are left out of that sum, per the GPU section.
 
 ### Egress works without a public IP
 

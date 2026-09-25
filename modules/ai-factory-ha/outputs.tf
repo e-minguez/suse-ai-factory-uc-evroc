@@ -130,6 +130,23 @@ output "gpu_quota_request" {
   }
 }
 
+output "quota_request" {
+  description = "This cluster's peak vCPU, memory (GB) and public-IP demand next to the organization's quota and current usage, known at PLAN time. GPU workers are excluded: their vCPUs and memory are not drawn from this quota (see gpu_quota_request). Usage includes this cluster's own existing resources, so on a first apply the headroom is limit - usage; on a re-apply it is larger by whatever this cluster already holds. availability.tf fails the plan only when demand alone exceeds the limit."
+  value = {
+    demand = local.quota_demand
+    limit = {
+      vcpus      = data.evroc_organization_quota.this.compute_vcpus
+      memory     = data.evroc_organization_quota.this.compute_memory
+      public_ips = data.evroc_organization_quota.this.networking_public_ips
+    }
+    usage = {
+      vcpus      = data.evroc_organization_quota.this.usage_vcpus
+      memory     = data.evroc_organization_quota.this.usage_memory
+      public_ips = data.evroc_organization_quota.this.usage_public_ips
+    }
+  }
+}
+
 output "vpc_cidr" {
   description = "CIDR of the cluster VPC."
   value       = local.vpc_cidr

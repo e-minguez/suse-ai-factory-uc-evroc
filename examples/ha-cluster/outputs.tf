@@ -110,6 +110,11 @@ output "gpu_quota_request" {
   value       = module.ai_factory.gpu_quota_request
 }
 
+output "quota_request" {
+  description = "Peak vCPU, memory and public-IP demand of this cluster next to the organization quota and current usage. Usage includes this cluster's own resources."
+  value       = module.ai_factory.quota_request
+}
+
 output "vpc_cidr" {
   description = "CIDR of the cluster VPC."
   value       = module.ai_factory.vpc_cidr

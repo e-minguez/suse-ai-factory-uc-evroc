@@ -380,7 +380,7 @@ extension(s) not found".
 | `deploy_nodes` | `true` | `false` stands up only the network, load balancer and jumphost. |
 | `image_build_timeout` | `5400` | Seconds `wait-for-image.sh` waits for every zone to report `done`. A zone reporting `failed` ends the wait early. |
 | `status_relay_port` | `8080` | Build-status relay port on the jumphost. Open to `admin_cidrs` (read-only) and `vpc_cidr` (publish) during pass 1 only, so `admin_cidrs` must include the address `terraform apply` runs from. |
-| `verify_flavor_availability` | `true` | Plan-time check against the live profile list; the error names the flavor and what is actually on offer. |
+| `verify_flavor_availability` | `true` | Plan-time check against the live profile list; the error names the flavor and what is actually on offer. Also fails the plan when the cluster's peak vCPU / memory / public-IP demand exceeds the organization quota (usage is not considered -- see the `quota_request` output). |
 | `jumphost_username` / `jumphost_image` | `suse` / `null` | Default image is openSUSE Leap 15.6. |
 
 ## Outputs
@@ -392,7 +392,8 @@ extension(s) not found".
 `build_status_url`,
 `control_plane_names`,
 `control_plane_fqids`, `control_plane_private_ips`, `control_plane_public_ips`,
-`gpu_node_names`, `gpu_node_private_ips`, `gpu_node_public_ips`, `vpc_cidr`,
+`gpu_node_names`, `gpu_node_private_ips`, `gpu_node_public_ips`,
+`gpu_quota_request`, `quota_request`, `vpc_cidr`,
 `subnet_cidrs`, `node_zones`, `security_group_names`.
 
 ## Security
