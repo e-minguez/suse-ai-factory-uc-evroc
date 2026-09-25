@@ -748,7 +748,7 @@ pipeline:**
   and reference it exactly like an evroc-provided OS image, deployable in any
   zone from one master copy. evroc names this as the right fit for this use
   case. It removes the per-zone build, the build hosts, the image-target disks,
-  the hotswap attachments, the sentinel wait *and* the two-pass apply: the module
+  the hotswap attachments, the build-status wait *and* the two-pass apply: the module
   would build one image, upload it, and create nodes from it in a single pass.
 - **Regional snapshots** — framed as a backup feature rather than an
   image-distribution one. It would fix the fan-out without fixing the two-pass
@@ -772,11 +772,13 @@ Two consequences fall out of that, both handled in the module:
   inbound path: evroc gives every VM outbound internet access regardless, which
   is all `podman pull` requires. They are reached with `ssh -J` through the
   public one, and they sit in their own security group that admits SSH from
-  that host's private address and nothing else.
+  that host's private address and nothing else. Nothing automated needs to
+  reach them: they push their build status to a relay on the public host (see
+  below), so `ssh -J` is for humans reading logs.
 - **The builds are independent, and nothing verifies they agree.** Each pulls
   the same OCI references at roughly the same moment, but OCI tags are mutable.
   A tag that moves mid-build gives one zone different software, and every
-  downstream signal — sentinels, snapshots, node boots — looks identical either
+  downstream signal — `done` reports, snapshots, node boots — looks identical either
   way. Comparing the built images does not help: `elemental customize` writes
   fresh filesystems, so filesystem UUIDs, GPT GUIDs and mtimes differ between
   any two runs and the sha256 sums never match (this module shipped that check
@@ -975,9 +977,31 @@ Fixed on both halves, and neither alone is enough:
   gone on consulting the real known_hosts — on the single host every builder is
   reached through. Hence the explicit `ProxyCommand=ssh … -W %h:%p`.
 
-It also captures ssh's stderr, prints it with every transient, and after five
-minutes of consecutive failures says out loud that the failure is probably not
-transient and gives a copy-pasteable command to reproduce it by hand.
+It also captured ssh's stderr, printed it with every transient, and after five
+minutes of consecutive failures said out loud that the failure was probably
+not transient.
+
+**Superseded (2026-09-25): the wait no longer uses SSH at all.** Each build
+host runs `curl -T` against a small status relay on the jumphost
+(`templates/status-relay.py`, `status_relay_port`, default 8080) at every step,
+on success and from its failure trap; `wait-for-image.sh` polls it over plain
+HTTP. That removes host keys, `ProxyCommand` and the operator's SSH key from
+the automated path, and a failed build now fails the apply within one poll
+instead of after `image_build_timeout`. Verified on evroc (2026-09-24):
+
+- Leap 15.6 ships python 3.6.15 (no `ThreadingHTTPServer`, hence the mixin),
+  and firewalld is inactive, so only the security group gates the port.
+- A builder in another zone reaches the jumphost's private IP, and the relay
+  sees the real 10.x source address — which is what lets it accept PUTs from
+  `vpc_cidr` only while `admin_cidrs` get read access.
+- The jumphost's public IP is not reachable from inside the VPC, so the
+  builders must be given its private address. That address cannot go into the
+  build script itself (every zone's script is one map the jumphost also reads:
+  a cycle), so builders get it from a file cloud-init writes.
+- Pass 2 removes the relay rules from the jumphost's group as an in-place
+  update. The relay keeps running, unreachable.
+
+The recycled-address problem above still applies to anyone SSHing in by hand.
 
 ### Compute is quota'd too, at 20 vCPU / 160 GB (verified 2026-09-18)
 
@@ -1180,8 +1204,8 @@ Two things to remember from this:
 `/var/lib/image-factory/boot-diagnostics.txt` — the installed kernel command
 line, the device labels the image's own Ignition binary searches for, the
 ignition dracut modules present, and `Install/install.yaml` — and
-`wait-for-image.sh` prints it into the apply log while the build hosts still
-exist.
+each build host copies it to the status relay, from which `wait-for-image.sh`
+prints it into the apply log — so it survives pass 2 destroying the builders.
 
 ### The built image is installation media, not a node image (verified 2026-09-21)
 

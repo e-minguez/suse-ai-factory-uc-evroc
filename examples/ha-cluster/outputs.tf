@@ -65,6 +65,11 @@ output "builder_private_ips" {
   value       = module.ai_factory.builder_private_ips
 }
 
+output "build_status_url" {
+  description = "Build-status relay on the jumphost, during pass 1: `curl $(terraform output -raw build_status_url)/<zone>`. null after pass 2."
+  value       = module.ai_factory.build_status_url
+}
+
 output "control_plane_names" {
   description = "Names of the control-plane VMs. Empty on a deploy_nodes = false plan."
   value       = module.ai_factory.control_plane_names

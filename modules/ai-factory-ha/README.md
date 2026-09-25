@@ -21,7 +21,7 @@ single graph walk:
 
 | | `image_ready` | What happens |
 |---|---|---|
-| Pass 1 | `false` | VPC, subnets, API VIP, security groups and the load balancer come up. One blank `evroc_disk.image_target` per zone is attached to that zone's build host by `evroc_hotswap_disk_attachment`. `image-factory.sh` builds the raw elemental image on each and `dd`s it onto the attached disk. `terraform_data.image_written` blocks on `scripts/wait-for-image.sh` until every host's sentinel carries this build's id. |
+| Pass 1 | `false` | VPC, subnets, API VIP, security groups and the load balancer come up. One blank `evroc_disk.image_target` per zone is attached to that zone's build host by `evroc_hotswap_disk_attachment`. `image-factory.sh` builds the raw elemental image on each and `dd`s it onto the attached disk. Each build host publishes its progress to a status relay on the jumphost (`templates/status-relay.py`, port `status_relay_port`), and `terraform_data.image_written` blocks on `scripts/wait-for-image.sh`, which polls that relay over plain HTTP until every zone reports `done` for this build's id -- or stops at once if one reports `failed`. |
 | Pass 2 | `true` | The attachments drop to an empty `for_each`, which **is** the detach. One `evroc_snapshot.ai_factory` per zone is taken from the now-free disks. Each node's boot disk is an `evroc_disk` cloned from its own zone's snapshot, and the control planes populate the load balancer's backend pool. |
 
 This module requires **provider 0.9.4 or newer** (`versions.tf` enforces it):
@@ -298,12 +298,13 @@ extension(s) not found".
 | `security-groups.tf` | jumphost / builder / control-plane / gpu groups |
 | `loadbalancer.tf` | one LB, one backend pool, four (listener, route, service) sets |
 | `availability.tf` | plan-time flavor checks against `data.evroc_compute_profiles` |
-| `image-build.tf` | per-zone blank disks, jumphost + builders, hotswap attachments, sentinel wait |
+| `image-build.tf` | per-zone blank disks, jumphost + builders, hotswap attachments, build-status wait |
 | `snapshot.tf` | build id, per-zone `evroc_snapshot`, `effective_snapshot_ids` |
 | `control-plane.tf`, `gpu-nodes.tf` | node disks, public IPs, VMs |
-| `templates/image-factory.sh.tftpl` | the on-jumphost build script |
+| `templates/image-factory.sh.tftpl` | the build script, run on every build host |
+| `templates/status-relay.py` | build-status relay on the jumphost: build hosts PUT, the operator GETs |
 | `templates/elemental/` | the elemental config directory, rendered and shipped |
-| `scripts/wait-for-image.sh` | operator-side SSH poll for the build sentinel |
+| `scripts/wait-for-image.sh` | operator-side HTTP poll of the status relay |
 
 ## Variables
 
@@ -377,7 +378,8 @@ extension(s) not found".
 | `image_ready` | `false` | Set by `deploy.sh`'s second pass. Do not edit by hand on a standing cluster: reverting it destroys the snapshot every node disk is cloned from. |
 | `snapshot_ids` | `{}` | Adopt **externally-owned** snapshots and skip the build entirely. Keyed by zone, one entry per entry in `zones`. Never point it at this module's own snapshots. |
 | `deploy_nodes` | `true` | `false` stands up only the network, load balancer and jumphost. |
-| `image_build_timeout` | `5400` | Seconds `wait-for-image.sh` waits for the sentinel. |
+| `image_build_timeout` | `5400` | Seconds `wait-for-image.sh` waits for every zone to report `done`. A zone reporting `failed` ends the wait early. |
+| `status_relay_port` | `8080` | Build-status relay port on the jumphost. Open to `admin_cidrs` (read-only) and `vpc_cidr` (publish) during pass 1 only, so `admin_cidrs` must include the address `terraform apply` runs from. |
 | `verify_flavor_availability` | `true` | Plan-time check against the live profile list; the error names the flavor and what is actually on offer. |
 | `jumphost_username` / `jumphost_image` | `suse` / `null` | Default image is openSUSE Leap 15.6. |
 
@@ -387,6 +389,7 @@ extension(s) not found".
 `kubernetes_api_endpoint`, `ingress_endpoint`, `rancher_hostname`,
 `rancher_url`, `rancher_bootstrap_password` (sensitive), `rke2_token`
 (sensitive), `snapshot_ids`, `image_target_disk_names`, `builder_private_ips`,
+`build_status_url`,
 `control_plane_names`,
 `control_plane_fqids`, `control_plane_private_ips`, `control_plane_public_ips`,
 `gpu_node_names`, `gpu_node_private_ips`, `gpu_node_public_ips`, `vpc_cidr`,

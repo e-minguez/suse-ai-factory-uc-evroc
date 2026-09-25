@@ -386,7 +386,8 @@ EOF
 echo "==> Pass 1: network, load balancer and the per-zone image factories. No cluster"
 echo "    nodes yet -- their boot disks are clones of a snapshot pass 2 has not taken."
 echo "    (this blocks for tens of minutes once the jumphost starts building the image;"
-echo "     watch it with: ssh <jumphost_username>@<jumphost ip> tail -f /var/log/elemental-factory.log)"
+echo "     progress: curl \"\$(terraform output -raw build_status_url)/<zone>\"; full log:"
+echo "     ssh <jumphost_username>@<jumphost ip> tail -f /var/log/elemental-factory.log)"
 apply_with_retry "Pass 1"
 
 echo "==> Pass 2: detach the image-build disk, snapshot it, and flip image_ready so nodes clone from it"

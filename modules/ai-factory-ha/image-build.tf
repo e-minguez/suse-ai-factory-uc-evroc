@@ -142,20 +142,45 @@ resource "evroc_public_ip" "jumphost" {
   user_labels = merge(local.common_labels, { "role" = "jumphost" })
 }
 
-# A local so the size preconditions below can read it -- a precondition can't
+# Locals so the size preconditions below can read them -- a precondition can't
 # reliably read back the resource's own config attribute.
 #
-# Per zone, because local.factory_script is per zone: the only thing that
-# differs between them is the name of the image-target disk each host looks for.
+# Per zone, because local.factory_script is per zone. Split in two because the
+# jumphost and the builders differ in how they take part in status reporting:
+# the jumphost RUNS the status relay (templates/status-relay.py) and publishes
+# to it on localhost; a builder publishes to it across the VPC, so it has to be
+# told the jumphost's private address. That address can only come from
+# evroc_virtual_machine.jumphost, and the jumphost reads its own user_data, so
+# the two cannot be one map: the whole map would depend on the jumphost VM,
+# and Terraform would report a cycle. The builders' half may depend on it
+# freely -- they are a different resource.
 locals {
-  jumphost_user_data = {
-    for z in var.zones : z => templatefile("${path.module}/templates/cloud-init.yaml.tftpl", {
-      files               = local.elemental_files
-      factory_script      = local.factory_script[z]
-      config_dir          = local.config_dir
-      ssh_authorized_keys = var.ssh_authorized_keys
-      jumphost_username   = var.jumphost_username
-    })
+  build_host_user_data_vars = {
+    files               = local.elemental_files
+    config_dir          = local.config_dir
+    ssh_authorized_keys = var.ssh_authorized_keys
+    jumphost_username   = var.jumphost_username
+    status_relay_port   = var.status_relay_port
+  }
+
+  jumphost_user_data = templatefile("${path.module}/templates/cloud-init.yaml.tftpl", merge(local.build_host_user_data_vars, {
+    factory_script      = local.factory_script[local.primary_zone]
+    status_relay_script = file("${path.module}/templates/status-relay.py")
+    # Only VPC addresses may publish; the operator's side of the relay is
+    # read-only. 127.0.0.0/8 is the jumphost's own build.
+    status_relay_push_cidrs = "${var.vpc_cidr} 127.0.0.0/8"
+    status_relay_zones      = join(" ", var.zones)
+    status_url              = ""
+  }))
+
+  builder_user_data = {
+    for z in local.builder_zones : z => templatefile("${path.module}/templates/cloud-init.yaml.tftpl", merge(local.build_host_user_data_vars, {
+      factory_script          = local.factory_script[z]
+      status_relay_script     = ""
+      status_relay_push_cidrs = ""
+      status_relay_zones      = ""
+      status_url              = "http://${evroc_virtual_machine.jumphost.private_ipv4_address}:${var.status_relay_port}/zones"
+    }))
   }
 
   # The zones whose build host is a builder rather than the jumphost. Derived
@@ -166,8 +191,6 @@ locals {
   # one at all. Empty on pass 2: see evroc_virtual_machine.builder for why they
   # are torn down there rather than left standing.
   builder_zones_active = var.image_ready ? toset([]) : local.builder_zones
-
-  jumphost_user = var.jumphost_username != "" ? var.jumphost_username : "root"
 }
 
 # openSUSE Leap, the build host's own OS -- not the elemental image it builds.
@@ -192,7 +215,7 @@ resource "evroc_virtual_machine" "jumphost" {
   subnet_ref      = evroc_subnet.this[local.primary_zone].fqid
   ssh_keys        = var.ssh_authorized_keys
 
-  cloud_config_user_data = local.jumphost_user_data[local.primary_zone]
+  cloud_config_user_data = local.jumphost_user_data
 
   # role = jumphost, not build-host: this VM is both, but it OUTLIVES the build
   # -- with control_plane_public_ip = false it stays the only inbound path into
@@ -215,8 +238,8 @@ resource "evroc_virtual_machine" "jumphost" {
       # nonsensitive() on the length only: user_data is built from sensitive
       # inputs, so its byte count inherits that -- and the count has to be
       # visible for the error to be actionable.
-      condition     = length(local.jumphost_user_data[local.primary_zone]) <= 32768
-      error_message = "Rendered jumphost user_data is ${nonsensitive(length(local.jumphost_user_data[local.primary_zone]))} bytes, over the 32 KiB tripwire (evroc's own limit is 1 MB, so this is the module's, not the platform's). Check the comment strip in locals.tf still covers both local.elemental_files and local.factory_script, then look for a template rendering something twice, unusually large ssh_authorized_keys (RSA keys run 700+ bytes each; ed25519 keys are ~80), or oversized credential values."
+      condition     = length(local.jumphost_user_data) <= 32768
+      error_message = "Rendered jumphost user_data is ${nonsensitive(length(local.jumphost_user_data))} bytes, over the 32 KiB tripwire (evroc's own limit is 1 MB, so this is the module's, not the platform's). Check the comment strip in locals.tf still covers both local.elemental_files and local.factory_script, then look for a template rendering something twice, unusually large ssh_authorized_keys (RSA keys run 700+ bytes each; ed25519 keys are ~80), or oversized credential values."
     }
   }
 }
@@ -252,8 +275,8 @@ resource "evroc_virtual_machine" "jumphost" {
 # The cost of this: if pass 2 fails partway, the builders are already gone and
 # the images on their disks are unreachable for inspection. Recovering means
 # --rebuild, not a retry. That trade is only worth taking because the images
-# have already been confirmed complete -- every zone's sentinel carries the
-# current build id -- before pass 2 is allowed to start.
+# have already been confirmed complete -- every zone has reported "done" with
+# the current build id -- before pass 2 is allowed to start.
 resource "evroc_virtual_machine" "builder" {
   for_each = local.builder_zones_active
 
@@ -270,13 +293,13 @@ resource "evroc_virtual_machine" "builder" {
 
   # No public_ip. Outbound still works -- see evroc_public_ip.jumphost above.
 
-  cloud_config_user_data = local.jumphost_user_data[each.key]
+  cloud_config_user_data = local.builder_user_data[each.key]
   user_labels            = merge(local.common_labels, { "role" = "builder" })
 
   lifecycle {
     precondition {
-      condition     = length(local.jumphost_user_data[each.key]) <= 32768
-      error_message = "Rendered builder user_data for zone ${each.key} is ${nonsensitive(length(local.jumphost_user_data[each.key]))} bytes, over the 32 KiB tripwire (evroc's own limit is 1 MB). See the same precondition on evroc_virtual_machine.jumphost for what to check."
+      condition     = length(local.builder_user_data[each.key]) <= 32768
+      error_message = "Rendered builder user_data for zone ${each.key} is ${nonsensitive(length(local.builder_user_data[each.key]))} bytes, over the 32 KiB tripwire (evroc's own limit is 1 MB). See the same precondition on evroc_virtual_machine.jumphost for what to check."
     }
   }
 }
@@ -316,8 +339,9 @@ resource "evroc_hotswap_disk_attachment" "image_target" {
   user_labels = merge(local.common_labels, { "role" = "image-build" })
 }
 
-# Blocks the apply until every zone's image-factory.sh sentinel confirms the
-# CURRENT build id was written onto that zone's image_target, or
+# Blocks the apply until every zone's image-factory.sh has reported, through
+# the status relay on the jumphost, that the CURRENT build id was written onto
+# that zone's image_target -- or until any zone reports it failed, or
 # image_build_timeout runs out. count = 0 only when var.snapshot_ids overrides
 # the build entirely -- there is no build to wait for at all then.
 #
@@ -338,14 +362,14 @@ resource "evroc_hotswap_disk_attachment" "image_target" {
 # cheerfully snapshot them anyway, under names derived from a build id that
 # never touched those disks, producing a cluster running an image the operator
 # already replaced. Nothing else in the module would notice: the disks have
-# valid contents, the GPT check passed, the sentinels are present.
+# valid contents, the GPT check passed, every zone reported "done".
 #
 # Keeping this resource alive makes that visible. A changed build_id shows up
 # in the pass-2 plan as "terraform_data.image_written must be replaced",
 # directly above the snapshots being created, which is the operator's chance to
-# stop. Approve it anyway and the provisioner re-runs against hosts whose disks
-# are being detached, so it times out and fails loudly rather than succeeding
-# quietly with the wrong bytes.
+# stop. Approve it anyway and the provisioner re-runs, sees IMAGE_READY=true
+# -- there is no build it could be waiting for -- and fails at once, loudly,
+# rather than succeeding quietly with the wrong bytes.
 #
 # deploy.sh does not hit this: it runs both passes back to back against one
 # config. It is hand-editing between passes -- or a bare `terraform apply`
@@ -368,35 +392,22 @@ resource "terraform_data" "image_written" {
   provisioner "local-exec" {
     command = "${path.module}/scripts/wait-for-image.sh"
     environment = {
-      # The bastion, dialled directly. Every other target is reached with
-      # `ssh -J` through it, using the OPERATOR's own key at both hops -- the
-      # same var.ssh_authorized_keys is installed on all of them, so no key
-      # material has to be generated or carried in state to make this work.
-      JUMPHOST_IP   = evroc_public_ip.jumphost.ip_address
-      JUMPHOST_USER = local.jumphost_user
+      # The relay on the jumphost, dialled on its PUBLIC address: the only
+      # one reachable from the operator's machine. Plain GETs, no SSH -- the
+      # builders publish to the relay across the VPC, so nothing has to reach
+      # them from outside. security-groups.tf opens the port to
+      # var.admin_cidrs only, and only while a build can be running.
+      STATUS_URL = "http://${evroc_public_ip.jumphost.ip_address}:${var.status_relay_port}/zones"
+      ZONES      = join(" ", var.zones)
 
-      # [{zone, host}, ...] -- private addresses, in zone order. Computed
-      # attributes, which is fine: these are provisioner VALUES, not for_each
-      # keys, so they may be unknown at plan time.
-      #
-      # Iterated over the RESOURCE, not over local.builder_zones: on pass 2 the
-      # builders are gone, and indexing the resource by a zone that no longer
-      # has an instance is an error even though this provisioner will never run
-      # again (local-exec fires on create only). Over the resource it simply
-      # yields [] -- which is also the correct value, there being nothing left
-      # to poll. A for over a map is emitted in key order, so this stays sorted
-      # without sort().
-      BUILDER_TARGETS = jsonencode([
-        for z, vm in evroc_virtual_machine.builder : {
-          zone = z
-          host = vm.private_ipv4_address
-        }
-      ])
-
-      PRIMARY_ZONE    = local.primary_zone
       BUILD_ID        = local.build_id
       TIMEOUT_SECONDS = var.image_build_timeout
       POLL_SECONDS    = 30
+
+      # true only in the edited-between-passes case described above: the
+      # relay port is closed and nothing is building, so the script fails
+      # fast instead of waiting out the timeout.
+      IMAGE_READY = tostring(var.image_ready)
     }
   }
 }
