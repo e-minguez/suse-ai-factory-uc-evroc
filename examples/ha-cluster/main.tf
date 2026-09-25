@@ -86,5 +86,6 @@ module "ai_factory" {
   deploy_nodes = var.deploy_nodes
 
   image_build_timeout        = var.image_build_timeout
+  status_relay_port          = var.status_relay_port
   verify_flavor_availability = var.verify_flavor_availability
 }

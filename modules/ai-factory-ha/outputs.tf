@@ -65,6 +65,11 @@ output "builder_private_ips" {
   value       = { for z, vm in evroc_virtual_machine.builder : z => vm.private_ipv4_address }
 }
 
+output "build_status_url" {
+  description = "Base URL of the build-status relay on the jumphost: `curl <url>/<zone>` prints that zone's \"<state> <build_id> <step>\" line. Reachable from var.admin_cidrs during pass 1 only; null afterwards, when security-groups.tf has closed the port."
+  value       = var.image_ready ? null : "http://${evroc_public_ip.jumphost.ip_address}:${var.status_relay_port}/zones"
+}
+
 # Every node resource below is for_each'd by hostname, not count'd, so these
 # iterate with a `for` expression rather than a [*] splat. The splat form is
 # not merely wrong style here -- applied to a for_each resource it is an error,
@@ -122,6 +127,23 @@ output "gpu_quota_request" {
   value = {
     by_pool  = local.gpu_pool_demand
     by_model = local.gpu_demand_by_model
+  }
+}
+
+output "quota_request" {
+  description = "This cluster's peak vCPU, memory (GB) and public-IP demand next to the organization's quota and current usage, known at PLAN time. GPU workers are excluded: their vCPUs and memory are not drawn from this quota (see gpu_quota_request). Usage includes this cluster's own existing resources, so on a first apply the headroom is limit - usage; on a re-apply it is larger by whatever this cluster already holds. availability.tf fails the plan only when demand alone exceeds the limit."
+  value = {
+    demand = local.quota_demand
+    limit = {
+      vcpus      = data.evroc_organization_quota.this.compute_vcpus
+      memory     = data.evroc_organization_quota.this.compute_memory
+      public_ips = data.evroc_organization_quota.this.networking_public_ips
+    }
+    usage = {
+      vcpus      = data.evroc_organization_quota.this.usage_vcpus
+      memory     = data.evroc_organization_quota.this.usage_memory
+      public_ips = data.evroc_organization_quota.this.usage_public_ips
+    }
   }
 }
 

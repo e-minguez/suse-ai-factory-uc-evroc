@@ -930,8 +930,8 @@ locals {
       cluster_name             = var.cluster_name
       log_file                 = "/var/log/elemental-factory.log"
 
-      # Written into the sentinel file the operator-side poller waits on, so a
-      # sentinel left behind by a PREVIOUS build reads as "not done yet" rather
+      # Carried in every status line the build publishes to the relay, so a
+      # status left behind by a PREVIOUS build reads as "not done yet" rather
       # than being mistaken for this one. One build id across every zone: the
       # zones build the same image, so a per-zone id would imply a difference
       # that does not exist.
@@ -942,6 +942,15 @@ locals {
       # is the fallback discriminator when it is not.
       image_target_disk_name = local.image_target_disk_names[z]
       image_target_disk_gb   = var.image_target_disk_gb
+
+      # Where the build reports its status: the relay on the jumphost. Only
+      # the zone (the path it publishes to) and the port go in here; the
+      # script defaults to localhost, and a builder learns the jumphost's
+      # address from builder_user_data at runtime. Putting that address in
+      # this map would make every zone's script depend on the jumphost VM,
+      # which itself reads this map -- a cycle.
+      zone              = z
+      status_relay_port = var.status_relay_port
 
       # "" = no override, which is what the script branches on. try() because
       # indexing into a null object is an error, not a null.

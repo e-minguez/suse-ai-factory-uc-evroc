@@ -7,8 +7,8 @@
 # that one field: its disk is created in that zone, it clones THAT ZONE's
 # snapshot, it attaches to that zone's subnet, and it joins that zone's
 # placement group. Every zone's snapshot holds the same image -- built
-# separately per zone because evroc snapshots cannot cross one, and checked for
-# byte equality by scripts/wait-for-image.sh.
+# separately per zone because evroc snapshots cannot cross one. Same inputs,
+# not verified equal: see scripts/wait-for-image.sh for why.
 
 locals {
   # Gates whether ANY control-plane resource exists at all: var.deploy_nodes

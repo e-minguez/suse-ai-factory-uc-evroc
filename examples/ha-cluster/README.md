@@ -77,7 +77,11 @@ dominates its running time and produces **no local output** while it runs --
 the apply simply blocks. Watch it from another terminal:
 
 ```bash
-# the jumphost, zones[0]
+# one status line per zone, "<state> <build id> <step>" -- what the apply is
+# waiting on (only during pass 1, from an admin_cidrs address)
+curl "$(terraform output -raw build_status_url)/a"
+
+# the full log on the jumphost, zones[0]
 ssh <jumphost_username>@<jumphost ip> tail -f /var/log/elemental-factory.log
 
 # any other zone's builder, tunnelled through the jumphost
@@ -92,7 +96,8 @@ Expect tens of minutes: a cold `podman pull` of the elemental customize image
 plus the raw build itself. The zones build in parallel, so three zones take
 about as long as one.
 
-The wait script confirms each zone's sentinel, and nothing more. It does not
+The wait script confirms each zone reported `done`, and nothing more. A zone
+that reports `failed` ends pass 1 at once, naming the zone and the step. It does not
 check that the zones built the same software, because an elemental raw image is
 not reproducible -- fresh filesystem UUIDs, GPT GUIDs and mtimes every run -- so
 the images differ even when the inputs are identical. If a zone-to-zone drift
@@ -231,7 +236,8 @@ cat pass2.auto.tfvars.json   # safe to delete once state is empty; image_ready
 | `snapshot "...-snapshot-a" is in zone "a" but disk is in zone "c"` from `disk-webhook.evroc.com` | A node is cloning the wrong zone's snapshot -- with the module as written this should not happen, so it means `snapshot_ids` was set by hand with entries that do not match `zones` | `terraform output snapshot_ids` and confirm one entry per zone. If `snapshot_ids` is set in `terraform.tfvars`, every id must be a snapshot in the zone it is keyed under |
 | Cannot reach a builder to read its build log | Builders have no public IP by design | `ssh -J <jumphost_username>@<jumphost ip> <jumphost_username>@<builder ip>`, with the address from `terraform output builder_private_ips` |
 | Pass 2 fails: snapshot cannot be created, disk still attached | The detach and the snapshot happen in the same apply and evroc has not finished the detach | Re-run `./deploy.sh`. The detach already succeeded, so the second run creates the snapshot cleanly. Nothing is half-built and the disk still holds the image either way -- see the ordering note in `modules/ai-factory-ha/snapshot.tf` |
-| Pass 1 runs far longer than expected, or never finishes | Image build stuck or failed | `ssh <jumphost_username>@<jumphost ip> tail -f /var/log/elemental-factory.log`; also check `image_build_timeout` |
+| Pass 1 runs far longer than expected, or never finishes | Image build stuck on a step | `curl "$(terraform output -raw build_status_url)/<zone>"` shows the step; `ssh <jumphost_username>@<jumphost ip> tail -f /var/log/elemental-factory.log` shows why. Also check `image_build_timeout` |
+| Wait script keeps printing `relay unreachable` | The address `terraform apply` runs from is not in `admin_cidrs`, which is all the relay port is open to. A connection with more than one egress IP may get through only some of the time | `curl -m 5 "$(terraform output -raw build_status_url)/a"` from the same machine. Add every egress address to `admin_cidrs` and re-run `./deploy.sh`; the build itself is unaffected |
 | `not enough quota ... no public IPs are available (out of 3)` partway through an apply | `control_plane_public_ip` / `gpu_public_ip` turned on against a default evroc project, which allows 3 public IPs -- two already spent on the API VIP and the jumphost (adding zones does not add to that: only `zones[0]`'s build host gets one) | Set both back to `false` and re-apply; the partially-created IPs are in state and get cleaned up. Nothing is lost by it -- egress works without them, nodes stay reachable via the jumphost, and the control plane answers on the load balancer |
 | `not enough quota ... Requested additional N vCPUs` from `virtualmachine-webhook.evroc.com` | A default evroc project allows 20 vCPU. Either `jumphost_flavor` was sized up (it multiplies by the zone count -- three `a1a.l` build hosts are 24 vCPU on their own), or `control_plane_flavor`/`gpu_pools` ask for more than fits alongside the jumphost | The stock defaults budget 12 vCPU in pass 1 and 16 in pass 2; see the quota table in `../../PLATFORM-NOTES.md`. Either restore them, drop to `zones = ["a"]`, or ask evroc to raise the quota -- a GPU pool needs that regardless |
 | `Ready: disk is missing DiskImageRef (ProvisioningFailed)` on a GPU VM | The project still enforces the pre-2026-09-23 rule that a GPU flavor's boot disk must come from an evroc-**provided** image, which requires `spec.source.diskImageRef` -- a snapshot clone has no such field, and every disk this module builds is a snapshot clone. Lifted on 2026-09-23; a project seeing it has not picked the change up | Ask evroc. There is no workaround in the module -- until it is lifted, set `gpu_pools = {}` and re-apply (the failed VM's boot disk is in state and gets destroyed). See `../../PLATFORM-NOTES.md` |
@@ -241,6 +247,7 @@ cat pass2.auto.tfvars.json   # safe to delete once state is empty; image_ready
 | Some nodes of a GPU pool create fine and others fail out of capacity | The pool is spread round-robin across `zones` but the flavor's stock only exists in one of them -- the usual case for GPU profiles | Pin the pool: `gpu_pools = { training = { flavor = ..., zone = "a" } }`. `terraform output node_zones` shows where each node was placed |
 | `terraform plan` proposes replacing every subnet and every node after an edit to `zones` | The list was reordered, not appended to | Subnet CIDRs are assigned by position in `zones`. **Do not approve** unless the replacement is intended -- restore the original order, then append |
 | `terraform plan` fails with "flavor ... is not currently offering" | Typo'd or withdrawn compute profile | The error names the offending flavor and evroc's current list; fix `control_plane_flavor`/`jumphost_flavor`/`gpu_pools[*].flavor`, or set `verify_flavor_availability = false` to skip the check |
+| `terraform plan` fails with "This cluster needs N vCPU / public IPs ... over the organization's quota" | The cluster alone cannot fit the org quota | Smaller `jumphost_flavor`/`control_plane_flavor`, fewer zones or control planes, `control_plane_public_ip`/`gpu_public_ip = false`, or ask evroc for a quota increase |
 | `kubectl` times out against `api_vip:6443` right after pass 2 | Load balancer backend pool not yet healthy | `evroc_lb_backend_pool` populates from the control-plane nodes as they come up; give RKE2 a minute to start listening |
 | Large-packet transfers hang or TLS handshakes stall intermittently | MTU mismatch between `vpc_mtu` and the actual VPC overlay | `cat /etc/cni/net.d/10-canal.conflist` on a node -- wrong value is silent otherwise |
 

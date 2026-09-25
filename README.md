@@ -120,8 +120,12 @@ Error: Resource precondition failed
 ```
 
 rather than partway through an apply that has already built a network, a load
-balancer and a jumphost. It needs API reachability at plan time; set
-`verify_flavor_availability = false` to skip it.
+balancer and a jumphost. The same gate fails the plan when the cluster's own
+peak vCPU, memory or public-IP demand exceeds the organization quota
+(`evroc_organization_quota`) -- three `a1a.l` build hosts against 20 vCPU, or
+`control_plane_public_ip = true` against 3 IPs -- and the `quota_request`
+output prints demand, limit and current usage. It needs API reachability at
+plan time; set `verify_flavor_availability = false` to skip it.
 
 ## Security
 

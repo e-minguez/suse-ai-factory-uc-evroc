@@ -29,7 +29,7 @@ variable "elemental_image" {
 
 variable "admin_cidrs" {
   type        = list(string)
-  description = "CIDR blocks allowed to reach the jumphost on 22/tcp. No default."
+  description = "CIDR blocks allowed to reach the jumphost on 22/tcp, and on status_relay_port during pass 1. Must include the address terraform runs from. No default."
 }
 
 variable "root_password_hash" {
@@ -356,6 +356,12 @@ variable "image_build_timeout" {
   type        = number
   default     = 5400
   description = "Seconds the image-build wait will poll before giving up."
+}
+
+variable "status_relay_port" {
+  type        = number
+  default     = 8080
+  description = "Port of the build-status relay on the jumphost, which the image-build wait polls. Open to admin_cidrs during pass 1 only."
 }
 
 variable "verify_flavor_availability" {

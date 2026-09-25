@@ -28,12 +28,58 @@ log() {
 log "=== image-factory starting ==="
 
 RAW_IMAGE=""
-SENTINEL_DIR="/var/lib/image-factory"
-SENTINEL="$SENTINEL_DIR/done"
+STATE_DIR="/var/lib/image-factory"
+DONE_FILE="$STATE_DIR/done"
+STATUS_FILE="$STATE_DIR/status"
+STEP=0
+mkdir -p "$STATE_DIR"
+
+# Where build status is published: the status relay on the jumphost
+# (templates/status-relay.py), which is what wait-for-image.sh polls from the
+# operator's machine. The jumphost reaches its own relay on localhost, which is
+# the default. A builder reads the jumphost's private address from a file its
+# own cloud-init writes -- not from this template, because baking that address
+# in here would make every zone's rendering depend on the jumphost VM, and the
+# jumphost's user_data reads this same map (a cycle; see image-build.tf).
+STATUS_URL="http://127.0.0.1:${status_relay_port}/zones"
+if [ -s /etc/image-factory/status-url ]; then
+  STATUS_URL=$(cat /etc/image-factory/status-url)
+fi
+
+# push <file> <url> <attempts>
+push() {
+  local i
+  for ((i = 1; i <= $3; i++)); do
+    curl -fsS -m 10 -T "$1" "$2" && return 0
+    sleep 5
+  done
+  log "WARNING: could not push $1 to $2 after $3 attempt(s)"
+  return 1
+}
+
+# publish <state> <text> -- one line, "<state> <build id> <text>", where state
+# is building, done or failed. The build id lets the poller tell this build's
+# status from one a previous build left on the relay. A missed `building` is
+# cosmetic, so it gets few attempts; `done` and `failed` are what the operator
+# is actually waiting on, so they get ~5 minutes of retries.
+publish() {
+  local tries=3
+  [ "$1" = building ] || tries=20
+  printf '%s %s %s\n' "$1" "${build_id}" "$2" > "$STATUS_FILE"
+  push "$STATUS_FILE" "$STATUS_URL/${zone}" "$tries"
+}
+
+step() {
+  STEP=$1
+  log "step $1/9: $2"
+  publish building "step $1/9: $2" || true
+}
 
 # Removes the raw (several GB, and useless once it is on the target disk) on
-# every exit path, logs a final status, and makes sure a failed run never
-# leaves a stale sentinel behind for wait-for-image.sh to mistake for success.
+# every exit path, logs a final status, and makes sure a failed run is
+# reported as failed -- both to the relay, so wait-for-image.sh stops at once
+# instead of waiting out image_build_timeout, and locally, by removing any
+# done file an earlier build left behind.
 cleanup() {
   status=$?
   if [ -n "$RAW_IMAGE" ] && [ -f "$RAW_IMAGE" ]; then
@@ -41,15 +87,16 @@ cleanup() {
     rm -f "$RAW_IMAGE"
   fi
   if [ "$status" -ne 0 ]; then
-    log "cleanup: build failed (exit $status) -- removing sentinel if present"
-    rm -f "$SENTINEL"
+    log "cleanup: build failed (exit $status) at step $STEP/9"
+    rm -f "$DONE_FILE"
+    publish failed "step $STEP/9 exit $status" || true
   fi
   log "=== image-factory exiting with status $status ==="
   exit $status
 }
 trap cleanup EXIT
 
-log "step 1/9: refreshing repos and installing podman, python3, curl"
+step 1 "refreshing repos and installing podman, python3, curl"
 zypper -n --gpg-auto-import-keys refresh \
   || log "zypper refresh reported a non-zero exit, continuing"
 # python3, not python3-base: the base-vs-full split of json/yaml handling has
@@ -58,13 +105,13 @@ zypper -n --gpg-auto-import-keys refresh \
 zypper -n install podman python3 python3-PyYAML curl \
   || log "zypper install reported a non-zero exit (packages may already be present), continuing"
 
-log "step 2/9: enabling podman.socket"
+step 2 "enabling podman.socket"
 systemctl enable --now podman.socket
 
-log "step 3/9: pulling ${elemental_image}"
+step 3 "pulling ${elemental_image}"
 podman pull "${elemental_image}"
 
-log "step 4/9: fetching the release manifest from ${aif_release_manifest_url}"
+step 4 "fetching the release manifest from ${aif_release_manifest_url}"
 # Curled rather than embedded in cloud-init: several KB against the 32 KiB
 # user_data ceiling, for no benefit -- the jumphost needs network access anyway.
 curl -fsS -o "${config_dir}/release_manifest.aif.yaml" "${aif_release_manifest_url}"
@@ -182,7 +229,7 @@ PYEOF
   cat "${config_dir}/release_manifest.yaml"
 fi
 
-log "step 5/9: running elemental customize against ${config_dir}"
+step 5 "running elemental customize against ${config_dir}"
 # No --local and no podman.sock mount: --local expects every OCI image
 # elemental3 unpacks at build time -- not just ${elemental_image} -- to already
 # be in the local store, erroring "No such image" instead of pulling, and there
@@ -197,7 +244,7 @@ podman run --rm \
   -v "${config_dir}:/config" \
   "${elemental_image}" customize --type raw
 
-log "step 6/9: locating produced raw image"
+step 6 "locating produced raw image"
 RAW_IMAGE=$(ls -t "${config_dir}"/image-*.raw 2>/dev/null | head -n1 || true)
 if [ -z "$RAW_IMAGE" ]; then
   log "ERROR: no ${config_dir}/image-*.raw produced by elemental customize"
@@ -209,7 +256,7 @@ log "found raw image: $RAW_IMAGE"
 # apparent one is the number that matters.
 log "raw image: $(du -h --apparent-size "$RAW_IMAGE" | cut -f1) apparent, $(du -h "$RAW_IMAGE" | cut -f1) on disk"
 
-log "step 7/9: resolving the target disk"
+step 7 "resolving the target disk"
 
 # Resolves the device node for the blank disk evroc attached for this build
 # (named image_target_disk_name, sized image_target_disk_gb) by evidence
@@ -369,7 +416,7 @@ if [ -z "$TARGET" ]; then
   exit 1
 fi
 
-log "step 8/9: writing $RAW_IMAGE onto $TARGET"
+step 8 "writing $RAW_IMAGE onto $TARGET"
 # conv=sparse is deliberately NOT used here. image_target is a persistent disk
 # that outlives this jumphost and survives across rebuilds -- it is the medium
 # evroc_snapshot is taken from, not scratch space -- so a zero region in this
@@ -388,9 +435,9 @@ if [ "$SIG" != "EFI PART" ]; then
 fi
 log "GPT signature confirmed"
 
-mkdir -p "$SENTINEL_DIR"
-sha256sum "$RAW_IMAGE" | cut -d' ' -f1 > "$SENTINEL_DIR/image.sha256"
-log "raw image sha256: $(cat "$SENTINEL_DIR/image.sha256")"
+mkdir -p "$STATE_DIR"
+sha256sum "$RAW_IMAGE" | cut -d' ' -f1 > "$STATE_DIR/image.sha256"
+log "raw image sha256: $(cat "$STATE_DIR/image.sha256")"
 
 # --- boot diagnostics ------------------------------------------------------
 #
@@ -420,7 +467,7 @@ log "raw image sha256: $(cat "$SENTINEL_DIR/image.sha256")"
 # while evroc presents `cidata`. See PLATFORM-NOTES.md. If this file ever shows
 # a platform id whose provider does not name `cidata`, that is the same bug
 # returning.
-DIAG="$SENTINEL_DIR/boot-diagnostics.txt"
+DIAG="$STATE_DIR/boot-diagnostics.txt"
 
 # Everything worth knowing about one mounted tree, whether that tree is a
 # partition of the image or the LiveOS squashfs unpacked from inside it.
@@ -539,11 +586,25 @@ else
   log "WARNING: could not collect boot diagnostics (image still built fine); continuing"
 fi
 
-log "step 9/9: writing sentinel"
-# Written LAST and ONLY on success. wait-for-image.sh, running on the
-# operator's machine, treats this file's presence -- carrying exactly this
-# build id -- as the sole definition of "the build is done".
-printf '%s\n' "${build_id}" > "$SENTINEL"
+# Copied to the relay because pass 2 destroys every builder, and the file with
+# it; wait-for-image.sh prints what it finds there. Capped at the relay's
+# 64 KiB limit. Best-effort, like the collection itself.
+if [ -s "$DIAG" ]; then
+  head -c 65536 "$DIAG" > "$DIAG.push"
+  push "$DIAG.push" "$STATUS_URL/${zone}/diag" 3 || true
+  rm -f "$DIAG.push"
+fi
+
+step 9 "publishing done"
+# Published LAST and ONLY on success. wait-for-image.sh, running on the
+# operator's machine, treats "done <this build id>" on the relay as the sole
+# definition of "the build is done". The local done file is for a human on the
+# host; nothing polls it.
+printf '%s\n' "${build_id}" > "$DONE_FILE"
+if ! publish "done" "image written to $TARGET"; then
+  log "ERROR: the image is on $TARGET, but the relay never accepted \"done\" -- wait-for-image.sh will time out"
+  exit 1
+fi
 
 log "=== image-factory finished successfully: $TARGET now holds the built image ==="
 log "the target disk is not detached or snapshotted here -- that happens on the NEXT terraform apply, once var.image_ready is flipped to true (see image-build.tf's evroc_hotswap_disk_attachment.image_target and snapshot.tf)"

@@ -56,6 +56,35 @@ locals {
     }
   }
 
+  # The build-status relay on the jumphost (templates/status-relay.py). The
+  # operator's machine reads it from var.admin_cidrs; the builders publish to
+  # it from inside the VPC. The relay itself enforces the split -- PUT only
+  # from vpc_cidr -- so the admin rules grant read access and nothing more.
+  #
+  # Only while a build can be running: pass 2 (image_ready = true) drops the
+  # rules, an in-place update of the jumphost group. The relay process keeps
+  # running on the jumphost, unreachable, holding the last status each zone
+  # published.
+  status_relay_rules = var.image_ready ? {} : merge(
+    {
+      for cidr in var.admin_cidrs :
+      "status-${replace(cidr, "/", "_")}" => {
+        protocol  = "TCP"
+        port      = var.status_relay_port
+        end_port  = null
+        remote_ip = cidr
+      }
+    },
+    {
+      "status-vpc" = {
+        protocol  = "TCP"
+        port      = var.status_relay_port
+        end_port  = null
+        remote_ip = var.vpc_cidr
+      }
+    },
+  )
+
   # Egress is wide open on every group: nothing in this module tries to
   # constrain outbound traffic, only inbound.
   egress_all_rules = {
@@ -109,7 +138,8 @@ locals {
 
 # --- jumphost --------------------------------------------------------------
 #
-# The sole public admin entrypoint. SSH from admin_cidrs in, everything out.
+# The sole public admin entrypoint. SSH from admin_cidrs in, plus the
+# build-status relay while a build can be running; everything out.
 resource "evroc_security_group" "jumphost" {
   name        = "${var.cluster_name}-jumphost"
   vpc_ref     = evroc_vpc.this.fqid
@@ -118,7 +148,7 @@ resource "evroc_security_group" "jumphost" {
   user_labels = merge(local.common_labels, { "role" = "jumphost" })
 
   dynamic "rule" {
-    for_each = local.admin_ssh_rules
+    for_each = merge(local.admin_ssh_rules, local.status_relay_rules)
     content {
       name      = rule.key
       direction = "Ingress"

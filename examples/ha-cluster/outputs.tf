@@ -65,6 +65,11 @@ output "builder_private_ips" {
   value       = module.ai_factory.builder_private_ips
 }
 
+output "build_status_url" {
+  description = "Build-status relay on the jumphost, during pass 1: `curl $(terraform output -raw build_status_url)/<zone>`. null after pass 2."
+  value       = module.ai_factory.build_status_url
+}
+
 output "control_plane_names" {
   description = "Names of the control-plane VMs. Empty on a deploy_nodes = false plan."
   value       = module.ai_factory.control_plane_names
@@ -103,6 +108,11 @@ output "gpu_node_public_ips" {
 output "gpu_quota_request" {
   description = "GPUs and vCPUs the configured gpu_pools will request, per pool and summed per GPU model. Known at plan time, so it shows in the plan diff before the apply that would be denied."
   value       = module.ai_factory.gpu_quota_request
+}
+
+output "quota_request" {
+  description = "Peak vCPU, memory and public-IP demand of this cluster next to the organization quota and current usage. Usage includes this cluster's own resources."
+  value       = module.ai_factory.quota_request
 }
 
 output "vpc_cidr" {

@@ -40,7 +40,7 @@ locals {
   #
   # ONE build id across every zone. The zones run the same build against the
   # same inputs, so a per-zone id would assert a difference that does not exist
-  # -- and would stop the sentinel check in wait-for-image.sh from being a
+  # -- and would stop the status check in wait-for-image.sh from being a
   # single comparison. The zone appears only in the snapshot NAME, which does
   # have to be unique.
   # "/compute/projects/<project>/regions/<region>/disks/" -- every disk fqid in

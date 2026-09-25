@@ -41,7 +41,9 @@ zones = ["a", "b", "c"]
 # --------------------------------------------------------------------------
 
 # CIDRs allowed to SSH into the jumphost. Your admin IP(s)/VPN range, not
-# 0.0.0.0/0.
+# 0.0.0.0/0. Also the only sources that can read the build-status relay
+# during pass 1, so include every egress address of the machine running
+# terraform, or pass 1 waits until image_build_timeout.
 admin_cidrs = ["REPLACE_WITH_YOUR_IP/32"]
 
 # At least one public key. Injected onto node_username on every elemental

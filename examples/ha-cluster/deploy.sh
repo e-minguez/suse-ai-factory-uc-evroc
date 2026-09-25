@@ -290,7 +290,10 @@ apply_with_retry() {
     rc=0
     # tee, so the operator still sees the apply stream live -- and stdin is
     # left alone, so an interactive (no --yes) approval prompt still works.
-    terraform apply ${TF_ARGS[@]+"${TF_ARGS[@]}"} 2>&1 | tee "$log" || rc=$?
+    # tee -i: Ctrl-C reaches the whole pipeline, and a tee that dies with it
+    # takes the errors Terraform prints while stopping -- including those of
+    # creates that failed earlier in the run -- down with it.
+    terraform apply ${TF_ARGS[@]+"${TF_ARGS[@]}"} 2>&1 | tee -i "$log" || rc=$?
 
     if [[ $rc -eq 0 ]]; then
       return 0
@@ -383,7 +386,8 @@ EOF
 echo "==> Pass 1: network, load balancer and the per-zone image factories. No cluster"
 echo "    nodes yet -- their boot disks are clones of a snapshot pass 2 has not taken."
 echo "    (this blocks for tens of minutes once the jumphost starts building the image;"
-echo "     watch it with: ssh <jumphost_username>@<jumphost ip> tail -f /var/log/elemental-factory.log)"
+echo "     progress: curl \"\$(terraform output -raw build_status_url)/<zone>\"; full log:"
+echo "     ssh <jumphost_username>@<jumphost ip> tail -f /var/log/elemental-factory.log)"
 apply_with_retry "Pass 1"
 
 echo "==> Pass 2: detach the image-build disk, snapshot it, and flip image_ready so nodes clone from it"

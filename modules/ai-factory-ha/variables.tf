@@ -87,7 +87,7 @@ variable "elemental_image" {
 
 variable "admin_cidrs" {
   type        = list(string)
-  description = "CIDR blocks allowed to reach the jumphost on 22/tcp. No default: 0.0.0.0/0 would be an open SSH door, and [] would silently lock everyone out."
+  description = "CIDR blocks allowed to reach the jumphost on 22/tcp, and -- during pass 1 only -- on var.status_relay_port, where wait-for-image.sh reads the build status. That relay is read-only from here. Must include the address `terraform apply` runs from, or pass 1 waits until image_build_timeout. No default: 0.0.0.0/0 would be an open SSH door, and [] would silently lock everyone out."
 
   validation {
     condition     = length(var.admin_cidrs) > 0
@@ -1086,11 +1086,22 @@ variable "deploy_nodes" {
 variable "image_build_timeout" {
   type        = number
   default     = 5400
-  description = "Seconds the image-build-wait local-exec (scripts/wait-for-image.sh) will poll before giving up. 5400 (90 min) gives headroom over a cold podman pull of the elemental image plus the raw build."
+  description = "Seconds the image-build-wait local-exec (scripts/wait-for-image.sh) will poll the status relay before giving up. 5400 (90 min) gives headroom over a cold podman pull of the elemental image plus the raw build. A build that FAILS does not use it up: the failing zone reports it and the wait stops at once."
+}
+
+variable "status_relay_port" {
+  type        = number
+  default     = 8080
+  description = "TCP port of the build-status relay on the jumphost (templates/status-relay.py). Every build host publishes its progress there and wait-for-image.sh polls it from the operator's machine, so no SSH is needed to tell when the image build is done. Open to var.admin_cidrs (read-only) and vpc_cidr (publish) during pass 1 only. Changing this replaces the jumphost, which forces a fresh image build."
+
+  validation {
+    condition     = var.status_relay_port >= 1024 && var.status_relay_port <= 65535 && floor(var.status_relay_port) == var.status_relay_port
+    error_message = "status_relay_port must be an integer from 1024 to 65535."
+  }
 }
 
 variable "verify_flavor_availability" {
   type        = bool
   default     = true
-  description = "Whether to run pre-flight checks, during plan, that the chosen compute profiles (control_plane_flavor, jumphost_flavor, every gpu_pools flavor) are actually offered by evroc right now -- see availability.tf. Best-effort: availability can still change between plan and apply."
+  description = "Whether to run pre-flight checks, during plan, that the chosen compute profiles (control_plane_flavor, jumphost_flavor, every gpu_pools flavor) are actually offered by evroc right now, and that the cluster's peak vCPU, memory and public-IP demand fits the organization quota -- see availability.tf. Best-effort: availability can still change between plan and apply, and the quota check ignores what else is already running."
 }

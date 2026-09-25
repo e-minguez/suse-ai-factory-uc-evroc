@@ -328,9 +328,9 @@ Those GPU vCPUs are **not** drawn from the ordinary compute quota — a
 allowance, for a total of 31, and the request was not denied.
 
 The quota itself cannot be checked at plan time. `data.evroc_compute_profiles`
-reports which profiles *exist*, not what the project may run, and the only quota
-data sources the provider ships — `evroc_project_quota` and
-`evroc_organization_quota` — expose object storage totals and nothing else. But
+reports which profiles *exist*, not what the project may run, and neither quota
+data source has a GPU counter (`evroc_organization_quota` covers vCPU, memory,
+public IPs, load balancers and block storage — see the public-IP section). But
 the *demand* side is plan-time knowable, because that same data source's
 `details[]` carries `gpu_quantity` and `gpu_model` per profile: the module
 multiplies it out into the `gpu_quota_request` output, so `terraform plan`
@@ -748,7 +748,7 @@ pipeline:**
   and reference it exactly like an evroc-provided OS image, deployable in any
   zone from one master copy. evroc names this as the right fit for this use
   case. It removes the per-zone build, the build hosts, the image-target disks,
-  the hotswap attachments, the sentinel wait *and* the two-pass apply: the module
+  the hotswap attachments, the build-status wait *and* the two-pass apply: the module
   would build one image, upload it, and create nodes from it in a single pass.
 - **Regional snapshots** — framed as a backup feature rather than an
   image-distribution one. It would fix the fan-out without fixing the two-pass
@@ -772,11 +772,13 @@ Two consequences fall out of that, both handled in the module:
   inbound path: evroc gives every VM outbound internet access regardless, which
   is all `podman pull` requires. They are reached with `ssh -J` through the
   public one, and they sit in their own security group that admits SSH from
-  that host's private address and nothing else.
+  that host's private address and nothing else. Nothing automated needs to
+  reach them: they push their build status to a relay on the public host (see
+  below), so `ssh -J` is for humans reading logs.
 - **The builds are independent, and nothing verifies they agree.** Each pulls
   the same OCI references at roughly the same moment, but OCI tags are mutable.
   A tag that moves mid-build gives one zone different software, and every
-  downstream signal — sentinels, snapshots, node boots — looks identical either
+  downstream signal — `done` reports, snapshots, node boots — looks identical either
   way. Comparing the built images does not help: `elemental customize` writes
   fresh filesystems, so filesystem UUIDs, GPT GUIDs and mtimes differ between
   any two runs and the sha256 sums never match (this module shipped that check
@@ -928,10 +930,19 @@ apply, creates whichever IPs fit, and errors on the rest. The nodes whose IPs
 failed are simply not created, and state is left holding the ones that
 succeeded.
 
-`data.evroc_project_quota` exists but exposes only object-storage counters
-(`object_storage_total_size`, `object_storage_usage`) — there is nothing for
-public IPs, so the module cannot check this at plan time. On a default project,
-set both toggles false:
+`data.evroc_project_quota` exposes only object-storage counters, but
+**`data.evroc_organization_quota` carries the rest** (read 2026-09-25):
+`compute_vcpus` / `usage_vcpus`, `compute_memory` / `usage_memory` (strings,
+`"160GB"`), `networking_public_ips` / `usage_public_ips`,
+`load_balancer_count`, `compute_block_storage`. On a single default project the
+org limits equal the project defaults above (20 vCPU, 160 GB, 3 IPs).
+availability.tf's `terraform_data.quota_check` now fails the **plan** when the
+cluster's own peak demand exceeds those limits, so `control_plane_public_ip =
+true` on a default quota stops at plan time instead of partway through an
+apply. It does not compare against limit − usage: usage includes the cluster's
+own existing resources and nothing at plan time says which, so every plan of a
+deployed cluster would warn. The `quota_request` output shows demand, limit and
+usage side by side instead. On a default project, set both toggles false:
 
 ```hcl
 control_plane_public_ip = false
@@ -975,9 +986,31 @@ Fixed on both halves, and neither alone is enough:
   gone on consulting the real known_hosts — on the single host every builder is
   reached through. Hence the explicit `ProxyCommand=ssh … -W %h:%p`.
 
-It also captures ssh's stderr, prints it with every transient, and after five
-minutes of consecutive failures says out loud that the failure is probably not
-transient and gives a copy-pasteable command to reproduce it by hand.
+It also captured ssh's stderr, printed it with every transient, and after five
+minutes of consecutive failures said out loud that the failure was probably
+not transient.
+
+**Superseded (2026-09-25): the wait no longer uses SSH at all.** Each build
+host runs `curl -T` against a small status relay on the jumphost
+(`templates/status-relay.py`, `status_relay_port`, default 8080) at every step,
+on success and from its failure trap; `wait-for-image.sh` polls it over plain
+HTTP. That removes host keys, `ProxyCommand` and the operator's SSH key from
+the automated path, and a failed build now fails the apply within one poll
+instead of after `image_build_timeout`. Verified on evroc (2026-09-24):
+
+- Leap 15.6 ships python 3.6.15 (no `ThreadingHTTPServer`, hence the mixin),
+  and firewalld is inactive, so only the security group gates the port.
+- A builder in another zone reaches the jumphost's private IP, and the relay
+  sees the real 10.x source address — which is what lets it accept PUTs from
+  `vpc_cidr` only while `admin_cidrs` get read access.
+- The jumphost's public IP is not reachable from inside the VPC, so the
+  builders must be given its private address. That address cannot go into the
+  build script itself (every zone's script is one map the jumphost also reads:
+  a cycle), so builders get it from a file cloud-init writes.
+- Pass 2 removes the relay rules from the jumphost's group as an in-place
+  update. The relay keeps running, unreachable.
+
+The recycled-address problem above still applies to anyone SSHing in by hand.
 
 ### Compute is quota'd too, at 20 vCPU / 160 GB (verified 2026-09-18)
 
@@ -1018,8 +1051,11 @@ The resulting budget, on the default three zones and three control planes:
 That leaves 4 vCPU. A GPU pool does not fit in it — `gn-*` profiles need their
 own quota increase, and so does any larger control-plane flavor.
 
-Like the public-IP quota, this is an admission webhook at create time, not a
-plan-time check, and `data.evroc_project_quota` exposes nothing about it.
+Like the public-IP quota, this is enforced by an admission webhook at create
+time. `data.evroc_organization_quota` does expose it, though, and
+`terraform_data.quota_check` fails the plan when the peak of either pass — the
+table above, computed from the flavors' `vcpus` and memory — exceeds the limit.
+GPU workers are left out of that sum, per the GPU section.
 
 ### Egress works without a public IP
 
@@ -1180,8 +1216,8 @@ Two things to remember from this:
 `/var/lib/image-factory/boot-diagnostics.txt` — the installed kernel command
 line, the device labels the image's own Ignition binary searches for, the
 ignition dracut modules present, and `Install/install.yaml` — and
-`wait-for-image.sh` prints it into the apply log while the build hosts still
-exist.
+each build host copies it to the status relay, from which `wait-for-image.sh`
+prints it into the apply log — so it survives pass 2 destroying the builders.
 
 ### The built image is installation media, not a node image (verified 2026-09-21)
 
