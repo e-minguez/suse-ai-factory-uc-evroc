@@ -28,6 +28,11 @@ output "ingress_endpoint" {
   value       = module.ai_factory.ingress_endpoint
 }
 
+output "cluster_name" {
+  description = "The prefix baked into every node hostname. Also read by clusters-to-rancher.sh from this directory's tfstate as the default name under which to register the cluster in Rancher when --cluster-name is not given explicitly."
+  value       = module.ai_factory.cluster_name
+}
+
 output "rancher_hostname" {
   description = "Hostname Rancher's ingress is configured for. null when \"rancher\" is not in components."
   value       = module.ai_factory.rancher_hostname

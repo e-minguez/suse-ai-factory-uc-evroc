@@ -75,6 +75,12 @@ crash.*.log
 # modules; their lock file is committed for reproducible applies.
 modules/**/.terraform.lock.hcl
 
+# Per-deployment copies of examples/ha-cluster (see its README, "Deploying
+# multiple clusters"). Local working roots, not source: committing them only
+# adds drifting duplicates of the example. The secret/state patterns above
+# already cover their tfvars and state; this keeps out the copied code too.
+/clusters/
+
 # Editor, tooling and OS noise.
 .claude/
 .DS_Store
