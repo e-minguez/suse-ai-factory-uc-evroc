@@ -1059,14 +1059,18 @@ GPU workers are left out of that sum, per the GPU section.
 
 ### VMs cannot be IPv4-only (verified 2026-09-25)
 
-The provider's `evroc_virtual_machine.stack_type` documents `ipv4-only`, but
-the platform refuses it on create:
+Provider 0.9.4 and older document `evroc_virtual_machine.stack_type =
+"ipv4-only"` and pass it through, but the platform refuses it on create:
 
 ```
 API error (403): IPv4OnlyStackTypeDeprecated - admission webhook
 "virtualmachine-webhook.evroc.com" denied the request: ipv4-only is deprecated
 and cannot be set on new VMs; use dual-stack or ipv6-only
 ```
+
+Provider 0.9.5 (2026-09-25, after we reported it) rejects `ipv4-only` at plan
+time and drops it from the docs; `dual-stack` and `ipv6-only` are the only
+accepted values. Existing IPv4-only VMs must omit the argument.
 
 Subnets and VPCs only offer `dual-stack` or `ipv6-only` too, so every VM gets
 an IPv6 address whether it wants one or not. The module leaves `stack_type`
@@ -1127,8 +1131,9 @@ ssh <node_username>@<control-plane private ip>    # allowed by the
 curl -sSf https://dp.apps.rancher.io/v2/ && echo "egress works"
 ```
 
-`evroc_virtual_machine.stack_type` accepts `ipv4-only`, `ipv6-only` and
-`dual-stack`, defaulting to the subnet's. The module leaves it at the default
+`evroc_virtual_machine.stack_type` accepts `ipv6-only` and `dual-stack`
+(`ipv4-only` is refused -- see "VMs cannot be IPv4-only"), defaulting to the
+subnet's. The module leaves it at the default
 and the image disables IPv6 per-interface at boot.
 
 ## Node roles come from user data, not from the VM
