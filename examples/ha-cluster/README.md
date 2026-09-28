@@ -352,6 +352,14 @@ first and `*.auto.tfvars` after it, so a variable set in both files silently
 takes the `common.tfvars` value -- the opposite of what an override usually
 means. Both files match `.gitignore`'s `*.tfvars`.
 
+This bites most with keys the example file sets that look shared but are not,
+such as `control_plane_public_ip` / `gpu_public_ip`: leave them in
+`common.tfvars` and a per-cluster `terraform.tfvars` cannot turn them on. To
+vary one per cluster, move it out of `common.tfvars` into every
+`terraform.tfvars`, or for a one-off pass `-var`, which outranks both files.
+`deploy.sh` forwards it to the preflight plan and both applies:
+`./deploy.sh -var control_plane_public_ip=true`.
+
 Give each cluster a distinct `cluster_name`. Terraform does not enforce
 uniqueness across independent state files, but the node hostnames, the default
 `rancher_hostname` derivation and `clusters-to-rancher.sh`'s default display
