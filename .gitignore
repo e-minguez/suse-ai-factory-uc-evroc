@@ -31,6 +31,10 @@
 *.tfplan
 *.tfplan.*
 
+# deploy.sh's per-run scratch: apply logs and the preflight's saved plan.
+# Removed on exit, but a SIGKILL leaves it -- with that plan in it.
+.deploy-tmp/
+
 # Provider credentials and local CLI config.
 .terraformrc
 terraform.rc

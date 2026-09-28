@@ -264,7 +264,7 @@ cd "$(git rev-parse --show-toplevel)"
 mkdir -p clusters
 for c in mgmt gpu-a gpu-b; do
   rsync -a --exclude 'terraform.tfstate*' --exclude '.terraform*' \
-    --exclude pass2.auto.tfvars.json --exclude '*.tfvars' \
+    --exclude pass2.auto.tfvars.json --exclude '*.tfvars' --exclude .deploy-tmp \
     examples/ha-cluster/ "clusters/$c/"
 done
 ```
