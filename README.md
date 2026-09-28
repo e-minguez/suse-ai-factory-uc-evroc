@@ -130,6 +130,12 @@ peak vCPU, memory or public-IP demand exceeds the organization quota
 output prints demand, limit and current usage. It needs API reachability at
 plan time; set `verify_flavor_availability = false` to skip it.
 
+`deploy.sh` adds a preflight on top: it stops when the cluster does not fit in
+what the organization has *free* (limit minus usage, e.g. with another cluster
+already running), and when an object the apply would create already exists
+outside state -- left by an interrupted or crashed apply -- in which case it
+writes import blocks to adopt it. See the example README.
+
 ## Security
 
 Every node on evroc is an ordinary VM, so **every node is behind an

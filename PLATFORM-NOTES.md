@@ -10,7 +10,7 @@ sources, no writable root, no post-boot compilation. Almost everything below is
 a consequence of those two properties meeting evroc's.
 
 Provider: [`evroc-oss/evroc`](https://registry.terraform.io/providers/evroc-oss/evroc),
-`~> 0.9`. Attribute names cited here are from that version's schema.
+`~> 0.9.4`. Attribute names cited here are from that version's schema.
 
 ---
 
@@ -32,8 +32,8 @@ BIOS-booting VM therefore finds no bootloader at all and sits at the firmware's
 "no bootable device" state — from the API the VM is `Running`, it never answers
 on any port, and the obvious conclusion is that the image is broken.
 
-The `compute-experimental-features-` prefix is the platform telling you this is
-not a stable interface. If a future evroc release renames or withdraws the
+The `compute-experimental-features-` prefix indicates this is not yet a stable
+interface. If a future evroc release renames or withdraws the
 label, this is the first thing to check when a previously working image stops
 booting. There is no boot-mode field on `evroc_virtual_machine`, so the label is
 the only lever.
@@ -49,8 +49,8 @@ Neither the CLI nor the web UI offers one. `evroc compute virtualmachine` has
 no `console`, no `serial`, no `vnc`. evroc support confirmed it; VNC access is
 on evroc's roadmap.
 
-This is the single biggest practical obstacle to bringing up a custom image here,
-and it is worth planning around rather than discovering. Every distinct failure
+This is the main practical constraint when bringing up a custom image here, and
+it is worth planning around rather than discovering. Every distinct failure
 in the boot path presents identically from outside — the API reports the VM
 `Running` and `Ready` within seconds, and nothing ever answers on any port:
 
@@ -99,7 +99,9 @@ zonal" below for why it cannot be done once and shared):
 6. Each node's boot disk is an `evroc_disk` with `snapshot = <its own zone's>`.
 
 Steps 1–3 and steps 4–6 are two separate applies, sequenced by the
-`image_ready` variable. `deploy.sh` runs both.
+`image_ready` variable. `deploy.sh` runs both, preceded by a preflight plan and
+followed by a short third apply that deletes the image-target disks once their
+snapshots exist (`--keep-build-disks` opts out).
 
 Two consequences worth stating plainly. First, the build hosts never receive
 evroc credentials: Terraform owns the detach and the snapshot, so nothing on a
@@ -122,7 +124,7 @@ timeout after 10m0s (attempted 25 times)
 Observed on a three-zone rebuild: three identical 200 GB builder disks, same
 image, same request, created in the same apply. Zones `a` and `b` came Ready
 comfortably inside the window and zone `c` did not. Provisioning time is not a
-property of the request; it varies by zone and by how busy the platform is.
+property of the request; it was observed to vary by zone.
 
 The failure is more expensive than it looks. The provider records the
 half-created disk as **tainted**, so the next apply destroys and recreates it —
@@ -130,7 +132,9 @@ paying the provisioning time over again, on a disk that was probably a minute
 from Ready — and everything downstream of it in that apply was skipped. So the
 module sets `timeouts { create = var.disk_create_timeout }` on every disk it
 creates, defaulting to 30 minutes. Waiting costs wall clock; timing out costs
-the attempt.
+the attempt. Deletes get the same treatment (`delete = var.disk_delete_timeout`,
+default 20 minutes), because destroying a disk left wedged mid-provisioning by
+the case below can outlast the provider's default too.
 
 `evroc_virtual_machine` and `evroc_snapshot` accept the same block (`create`,
 `delete`, and `update` on the VM) if either turns out to need it.
@@ -153,8 +157,8 @@ status.conditions:
 and never moved. `lastTransitionTime` equal to `creationTimestamp` is the tell:
 the import was scheduled and nothing has happened since. Blank disks in the same
 zone completed normally, and identical image-backed disks in zones `a` and `b`
-were Ready in about two minutes, so it is the image-import path in that zone,
-not the zone and not the request.
+were Ready in about two minutes, which points to the image-import path in that
+zone rather than the zone as a whole or the request.
 
 Nothing in Terraform recovers from this — the disk is tainted at timeout and
 recreated into the same hang. The workaround is `zones = ["a", "b"]`, which
@@ -281,8 +285,8 @@ denied the request: cannot deploy a GPU VM in zone "b". GPU VMs are currently
 only supported on zone "a"
 ```
 
-The wording ("currently") reads like a rollout, not a design, so expect it to
-widen. Two things make it worse than a plan-time error:
+The message says "currently", so the rule may widen. Two properties make it
+costlier than a plan-time error:
 
 - It fires **per VM, at apply time**, so a pool spread round-robin over three
   zones creates every node's boot disk first, then 403s on the two-thirds that
@@ -306,8 +310,9 @@ GPUs. Only 1 "nvidia.com/AD102GL_L40S" GPUs available (out of 1 in quota)
 A default project carries **one** L40S. The quota is counted per GPU *model*
 (`nvidia.com/AD102GL_L40S`), not per flavor and not as part of the vCPU budget.
 
-**The flavor size is the GPU count.** This is the part that makes the error
-message confusing, because the number it quotes appears nowhere in the tfvars:
+**The flavor size is the GPU count.** This is what makes the error message hard
+to map back to the config, because the number it quotes appears nowhere in the
+tfvars:
 
 | flavor | GPUs | vCPUs | memory | local disk |
 |---|---|---|---|---|
@@ -415,7 +420,7 @@ deployed to every zone, attaching to the default subnet in each zone."*
 0.9.3: `terraform providers schema -json` listed only `name`, `public_ip_ref`,
 `project`, `region`, `user_labels` and the `listener` block, and
 `resource_loadbalancer.go` never set `Spec.BackendNetwork`. So every load
-balancer this module has ever built sat in the **default** VPC while every
+balancer this module built before 0.9.4 sat in the **default** VPC while every
 backend sat in `evroc_vpc.cluster` (`10.20.0.0/16`). The data plane has no
 route to the pool. The VIP still answers the SYN — that is the frontend — and
 then there is nowhere to send the bytes.
@@ -427,7 +432,7 @@ Why every earlier test came back clean, and why none of them found this:
 
 | Observation | Why it is consistent with the wrong VPC |
 |---|---|
-| Every object reports `Ready` | The controllers only validate references. Nothing in the chain checks reachability. |
+| Every object reports `Ready` | Observed: `Ready` reflects that references resolved, not data-plane reachability. |
 | `BackendService.status.backends` resolves all three VMs with correct **private** addresses and zones | Membership is resolved from the VM objects by the control plane. It is metadata, not a data-plane probe. |
 | Security group admits 6443/9345 from `0.0.0.0/0`, verified by a successful curl from a VM in a *different* security group | Correct, and irrelevant — the packets never arrive. |
 | A single-backend pool in one zone still resets | Zone was never the variable. |
@@ -467,17 +472,20 @@ The one operational consequence that remains: **`backend_network` forces
 replacement.** Changing `var.vpc_cidr` or `var.zones` destroys and recreates the
 load balancer, and the VIP stops answering for the length of it.
 
-Related and still unresolved: **Traefik bound no host ports.** The pod ran, but
-nothing listened on 80, 443 or 8080 on the node, so the `hostPort: 8080`
-health-check entrypoint this module's `HelmChartConfig` depends on was not in
-effect. Suspect the same lateness that afflicts canal — the values arriving
-after the chart has already installed — but that is a guess, not a diagnosis.
+Seen once during early bring-up and not since: **Traefik bound no host ports.**
+The pod ran, but nothing listened on 80, 443 or 8080 on the node, so the
+`hostPort: 8080` health-check entrypoint this module's `HelmChartConfig` depends
+on was not in effect. It has not recurred: from 2026-09-22 the Rancher
+dashboard is served through the 443 listener, whose health check targets
+`/ping` on 8080 (see "Egress works without a public IP"). The cause was never
+diagnosed; if it comes back, the same values-arrive-late problem as canal is
+the first suspect.
 
 ### An unset health-check `target_port` becomes 0, not the service's port (2026-09-21)
 
-`evroc_lb_backend_service.health_check.target_port` is optional, and the
-obvious reading — leave it out and the check runs against the port the service
-balances — is wrong. The API stores **0**. A health check against port 0 never
+`evroc_lb_backend_service.health_check.target_port` is optional. If it is
+omitted, the API stores **0** rather than defaulting to the port the service
+balances. A health check against port 0 never
 passes, so the service carries zero healthy backends while every backend is
 healthy, and the listener accepts each connection and resets it:
 
@@ -504,13 +512,13 @@ Three things make it hard to spot:
   Terraform stores.
 - `terraform state show` is where it shows up: `health_check { target_port = 0 }`.
 
-**The LB API reports no backend health at all**, which is why this has to be
-found with `curl`. Every object — load balancer, route, backend service —
-reported `status.conditions: [{type: Ready, status: "True"}]` throughout, on a
-service that was resetting every connection; `Ready` means the object
-reconciled, not that anything behind it answers. `status.backends` on a backend
-service lists pool *membership*, not health, and `backendpool get` returns
-`status: null`. There is no "how many members are in rotation" to query.
+**The LB API does not currently expose per-backend health**, which is why this
+has to be found with `curl`. Every object — load balancer, route, backend
+service — reported `status.conditions: [{type: Ready, status: "True"}]`
+throughout, on a service that was resetting every connection; `Ready` means the
+object reconciled, not that anything behind it answers. `status.backends` on a
+backend service lists pool *membership*, not health, and `backendpool get`
+returns `status: null`. There is no "how many members are in rotation" to query.
 
 `loadbalancer.tf` now passes `coalesce(each.value.health_check_target,
 each.value.port)`, so a service that wants the check on its own port says so
@@ -520,7 +528,7 @@ explicitly. Never let this attribute go null.
 
 The LB API is Kubernetes-style underneath: the objects are
 `backendservices.loadbalancer.evroc.com`, they carry a resourceVersion, and a
-controller reconciles them. Two consequences that bite together.
+controller reconciles them. Two consequences combine.
 
 The provider declares several attributes Optional **without** Computed —
 confirmed with `terraform providers schema -json`: `ip_protocol_selection`,
@@ -550,22 +558,24 @@ Conflict - Operation cannot be fulfilled on backendservices.loadbalancer.evroc.c
 changes to the latest version and try again
 ```
 
-Typically one or two of the four succeed and the rest fail, which reads like a
-flaky API rather than a plan that should have been empty. `terraform apply
+Typically one or two of the four succeed and the rest fail, which looks
+intermittent but is caused by a plan that should have been empty. `terraform apply
 -parallelism=1` makes it go away and hides the real cause.
 
 The fix is in `loadbalancer.tf`: pin those attributes to the API's own defaults.
 The plan goes empty, so the writes stop, so the conflicts stop. Worth
 generalising — on this provider, an attribute that reappears as `-> null` in
-consecutive plans is missing `Computed`, and the cure is always to state the
-server's value rather than to retry the apply.
+consecutive plans is likely Optional without Computed in the provider schema
+(worth reporting upstream), and the cure is to state the server's value rather
+than to retry the apply.
 
 ### …but a REAL change to several LB objects at once conflicts too (2026-09-22)
 
 Pinning the defaults removes the *spurious* writes. It does not remove the
-conflict, because the conflict is a property of the API, not of that bug. Any
-change that touches more than one load-balancer child object hits it again —
-observed on a one-line change that added labels to every resource in the module:
+conflict, because the conflict is a property of the API, not of that schema
+issue. Any change that touches more than one load-balancer child object hits it
+again — observed on a one-line change that added labels to every resource in the
+module:
 
 ```
 module.ai_factory.evroc_lb_l4_route.cluster["api"]: Modifications complete after 0s
@@ -576,9 +586,9 @@ your changes to the latest version and try again
 ```
 
 One of the four succeeded and the other three lost the race, exactly as the
-backend services did. The controller reconciles the siblings when any one of
-them changes, which bumps the resourceVersion the other three in-flight writes
-were built against.
+backend services did. This is consistent with the controller reconciling the
+siblings when any one of them changes, bumping the resourceVersion the other
+three in-flight writes were built against.
 
 **There is no Terraform-side fix.** Parallelism is global (`-parallelism=1`
 serialises the whole apply, including the tens of minutes of image build), and
@@ -664,15 +674,15 @@ its own zone, so spanning zones means one subnet per zone -- there is no
 stretched subnet. The load balancer and its backend pool are regional, so
 **one** load balancer fronts backends in every zone.
 
-### `evroc_snapshot` is zonal, and its schema says otherwise (verified 2026-09-18)
+### `evroc_snapshot` is zonal (verified 2026-09-18)
 
-This is the single most expensive thing to get wrong on this platform, so it
-gets its own heading.
+This is the most consequential constraint for this module, so it gets its own
+heading.
 
-`evroc_snapshot` **looks regional**. Its schema has a `region` attribute and no
-`zone` attribute at all; the only thing tying it to a zone is the disk named by
-`disk_ref`. Plan and apply both succeed. The constraint surfaces one resource
-later, when a node disk in another zone tries to clone it:
+`evroc_snapshot`'s schema has a `region` attribute and no `zone` attribute; the
+only thing tying it to a zone is the disk named by `disk_ref`. Plan and apply
+both succeed. The constraint surfaces one resource later, when a node disk in
+another zone tries to clone it:
 
 ```
 Error: error creating disk <cluster>-cp-03-boot: API error (403): Forbidden -
@@ -680,7 +690,7 @@ admission webhook "disk-webhook.evroc.com" denied the request: snapshot
 "<cluster>-<build-id>-snapshot" is in zone "a" but disk is in zone "c"
 ```
 
-evroc's own docs state it plainly: *"Snapshots are zonal resources. Each
+evroc's documentation states: *"Snapshots are zonal resources. Each
 snapshot exists in the same zone as the source disk it was created from. […] If
 you need disks in different zones, you would need to create separate snapshots
 from disks in those respective zones."*
@@ -711,10 +721,12 @@ succeeded.
 
 **What is still not verified is booting such a clone.** `probe-c` was created
 and never started, and no node has yet been built from a snapshot whose source
-disk was already gone. `var.retain_image_target_disks` still defaults to `true`
-(see the race below), but `deploy.sh` reclaims by default in a pass of its own;
-`--keep-build-disks` keeps the 96 GB as a hedge against that untested
-dependency.
+disk was already gone. That untested dependency is why
+`var.retain_image_target_disks` still defaults to `true` at the module level.
+`deploy.sh` reclaims by default, in a pass of its own because of the race
+below; `--keep-build-disks` keeps the 96 GB as a hedge. The first node created
+after a reclaim (a scale-out, a replacement, a new GPU pool) is what will
+exercise it.
 If you do reclaim, do it in **an apply of its own, after** pass 2 — creating a
 snapshot and destroying the disk it is taken from in one apply depends on an
 ordering Terraform's graph does not pin down, and losing that race leaves the
@@ -799,8 +811,8 @@ is out of scope.
 **Current state: GPU pools work.** A `gn-l40s.s` node booted from this module's
 own snapshot runs, and evroc confirmed the change. Nothing in the module was
 altered for it — `gpu-nodes.tf` had always been written for this. The rest of
-this section is the history, kept because the error is opaque and a project
-that has not picked up the change will still produce it.
+this section is the history, kept because the error does not name the rule and a
+project that has not picked up the change will still produce it.
 
 Until then, GPU VMs were restricted to disks created from an evroc-provided
 image, because the platform injects a cloud-init that installs the GPU
@@ -814,8 +826,8 @@ failed: VM <node> provisioning failed:
   - VMIsRunning: disk is missing DiskImageRef (ProvisioningFailed)
 ```
 
-The message names the missing field, not the rule, which is why this took a
-round-trip with evroc to identify. Note what it is *not*: not a quota problem,
+The message names the missing field, not the rule; evroc support identified
+the rule behind it. Note what it is *not*: not a quota problem,
 not the zone-`a` webhook, not anything about the snapshot's health. The same
 snapshot, in the same zone, booted control-plane VMs perfectly well — the
 restriction was on the GPU flavors only.
@@ -934,15 +946,26 @@ succeeded.
 **`data.evroc_organization_quota` carries the rest** (read 2026-09-25):
 `compute_vcpus` / `usage_vcpus`, `compute_memory` / `usage_memory` (strings,
 `"160GB"`), `networking_public_ips` / `usage_public_ips`,
-`load_balancer_count`, `compute_block_storage`. On a single default project the
-org limits equal the project defaults above (20 vCPU, 160 GB, 3 IPs).
+`load_balancer_count`, `compute_block_storage`. On an untouched single-project
+organization the limits equal the project defaults above (20 vCPU, 160 GB,
+3 IPs); after a quota increase they are whatever evroc raised them to, so read
+the data source (or the `quota_request` output) rather than assuming either.
 availability.tf's `terraform_data.quota_check` now fails the **plan** when the
 cluster's own peak demand exceeds those limits, so `control_plane_public_ip =
 true` on a default quota stops at plan time instead of partway through an
 apply. It does not compare against limit − usage: usage includes the cluster's
 own existing resources and nothing at plan time says which, so every plan of a
 deployed cluster would warn. The `quota_request` output shows demand, limit and
-usage side by side instead. On a default project, set both toggles false:
+usage side by side instead.
+
+`examples/ha-cluster/deploy.sh` does compare against free quota, because it
+knows what the module cannot: before the first apply it plans the run, sums the
+evroc objects this directory's state already holds, and stops when the
+cluster's peak exceeds limit − usage + own. That catches a second cluster in
+the same organization, or a stale one nobody destroyed, before anything is
+created. `--skip-quota-check` turns the stop into a warning.
+
+On a default project, set both toggles false:
 
 ```hcl
 control_plane_public_ip = false
@@ -954,7 +977,7 @@ load balancer either way.
 
 ### Public IPs are recycled across clusters, which breaks SSH host keys (2026-09-22)
 
-With a quota of three and a pool shared across the region, a destroyed
+With a small quota and a pool shared across the region, a destroyed
 cluster's public IP comes back to the next one often enough to treat it as the
 normal case rather than bad luck. The new jumphost is a different machine with
 a different host key on the same address, so the operator's `~/.ssh/known_hosts`
@@ -1057,6 +1080,24 @@ time. `data.evroc_organization_quota` does expose it, though, and
 table above, computed from the flavors' `vcpus` and memory — exceeds the limit.
 GPU workers are left out of that sum, per the GPU section.
 
+#### Deleted VMs can keep counting against quota briefly (observed 2026-09-25)
+
+Quota appears to be released asynchronously, after the delete call returns.
+On one pass 2, the builders in zones `b` and `c` were destroyed and a
+control-plane create 10–15 seconds later was denied: the webhook counted
+20/20 vCPU while the VMs still running added up to 12, the difference being
+exactly the two deleted `a1a.m` builders. A re-run a little later succeeded.
+Raised with evroc.
+
+Two places this shows up:
+
+- **Pass 2**, between the builder teardown and the first node creates. The
+  Terraform ordering is correct (`evroc_snapshot.ai_factory` depends on the
+  builders); the gap is on the quota side. Re-running `./deploy.sh` converges.
+- **Back-to-back clusters.** Deploying straight after destroying another cluster
+  in the same organization can be refused on quota that `evroc_organization_quota`
+  or the evroc console would show as free a minute later. Wait and re-run.
+
 ### VMs cannot be IPv4-only (verified 2026-09-25)
 
 The provider's `evroc_virtual_machine.stack_type` documents `ipv4-only`, but
@@ -1098,15 +1139,16 @@ evroc support confirmed the mechanism (2026-09-19):
 > and out to the internet. However, those gateways are not user-configurable in
 > any way.
 
-Two consequences. The gateways are **shared and opaque**: no control over the
-source address a node presents, so anything upstream that allowlists by source IP
-cannot be pointed at a node without a public IP of its own. And egress is
-governed **only** by security groups — evroc defaults to deny-all, and this
-module's `egress_all_rules` (all TCP, all UDP, `0.0.0.0/0`) is what opens it.
-Tightening that is the supported way to restrict egress; there is nothing at the
-gateway to configure. Note that those rules cover TCP and UDP and nothing else,
-so ICMP is blocked in both directions — `ping` between two VMs in this VPC fails
-by design and is useless as a liveness check. Probe a TCP port instead.
+Two consequences. The gateways are **shared and not user-configurable**: no
+control over the source address a node presents, so anything upstream that
+allowlists by source IP cannot be pointed at a node without a public IP of its
+own. And egress is governed **only** by security groups — evroc defaults to
+deny-all, and this module's `egress_all_rules` (all TCP, all UDP, `0.0.0.0/0`)
+is what opens it. Tightening that is the supported way to restrict egress; there
+is nothing at the gateway to configure. Note that those rules cover TCP and UDP
+and nothing else, so ICMP is blocked in both directions — `ping` between two VMs
+in this VPC fails by design and is useless as a liveness check. Probe a TCP port
+instead.
 
 This matters twice over. It is what makes `control_plane_public_ip = false` and
 `gpu_public_ip = false` safe despite the image not being self-contained —
@@ -1127,9 +1169,10 @@ ssh <node_username>@<control-plane private ip>    # allowed by the
 curl -sSf https://dp.apps.rancher.io/v2/ && echo "egress works"
 ```
 
-`evroc_virtual_machine.stack_type` accepts `ipv4-only`, `ipv6-only` and
-`dual-stack`, defaulting to the subnet's. The module leaves it at the default
-and the image disables IPv6 per-interface at boot.
+`evroc_virtual_machine.stack_type` accepts `ipv6-only` and `dual-stack` on new
+VMs (`ipv4-only` is refused, see "VMs cannot be IPv4-only"), defaulting to the
+subnet's. The module leaves it at the default and the image disables IPv6
+per-interface at boot.
 
 ## Node roles come from user data, not from the VM
 
@@ -1153,18 +1196,21 @@ typo and not the hypervisor's name — see below.
 
 A VM carries a third block device, `vdb`, 1 MB, partitionless, labelled
 `cidata`, holding two files: `user-data` and `meta-data`. That is a standard
-cloud-init NoCloud drive — evroc builds it themselves; it is not KubeVirt's own
-rendering, which would name the files `userdata` and `metadata`. A 15 813-byte
+cloud-init NoCloud drive — the file naming matches NoCloud rather than
+KubeVirt's default rendering, which would name the files `userdata` and
+`metadata`. A 15 813-byte
 `user-data` has been delivered intact, which raises the known-good lower bound
 from 14 581.
 
 ### `ignition.platform.id` must be `proxmoxve`, not `kubevirt` (resolved 2026-09-21)
 
-This cost several days, so the reasoning is written out in full.
+The reasoning is written out in full because the obvious choice does not work.
 
-evroc runs KubeVirt — the guest's own DMI string is `KubeVirt None` — and evroc
-recommended `ignition.platform.id=kubevirt`. It is the wrong value, because
-`ignition.platform.id` names a config-**delivery convention**, not a hypervisor.
+evroc runs KubeVirt — the guest's own DMI string is `KubeVirt None` — so
+`ignition.platform.id=kubevirt` matches the hypervisor. But
+`ignition.platform.id` selects a config-**delivery convention**, not a
+hypervisor: evroc presents user data on a NoCloud (`cidata`) drive, and the
+Ignition provider that reads that convention is `proxmoxve`.
 
 The symptom was that every control-plane node reported Running and Ready through
 the API while answering nothing on any port, ever. With no serial console and no
@@ -1178,7 +1224,7 @@ Expecting device /dev/disk/by-label/ignition...
 [***] A start job is running for Ignition (fetch-offline) (48s / no limit)
 ```
 
-Both halves of that mislead, and both wasted time:
+Both halves of that are easy to misread:
 
 - The `by-label/ignition` wait is **not** the failure. It comes from openSUSE's
   `30ignition-microos` dracut module (`ignition-setup-user.sh`), whose mount is
@@ -1228,9 +1274,9 @@ Two things to remember from this:
 - Verify a provider by running it, not by reading about it. Ignition 2.21.0 has
   30 providers compiled in; `strings $IGN | grep -oE 'internal/providers/[a-z0-9]+'`
   lists them, and any one of them can be pointed at a real drive in userspace.
-- On a platform with no console, prefer failures that are loud and bounded. The
-  reason this took days is that the failure mode was an infinite silent retry
-  inside an initrd on a machine with no way to look at it.
+- On a platform with no console, prefer failures that are loud and bounded.
+  Without a console, an unbounded retry inside the initrd cannot be seen from
+  outside.
 
 `image-factory.sh` now records the equivalent evidence at build time into
 `/var/lib/image-factory/boot-diagnostics.txt` — the installed kernel command
@@ -1287,7 +1333,7 @@ Ignition limit: a VM is a KubeVirt object underneath, user data is a field in
 it, and 1 MB is the ceiling on the object. The `cidata` drive in the guest is
 exactly 1 M (see the block-device table above), which is the same number seen
 from the other side. The largest payload this module has actually shipped is
-14 581 bytes, so there are roughly two orders of magnitude of headroom.
+15 813 bytes, so there are roughly two orders of magnitude of headroom.
 
 The module checks two different numbers, and they mean different things:
 

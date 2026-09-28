@@ -20,6 +20,12 @@ variable reference and evroc-specific behaviour, see:
 ## 1. Prerequisites
 
 - Terraform >= 1.9, and the evroc provider >= 0.9.4 (pinned in `versions.tf`).
+  Avoid Terraform 1.16.4: a panic on an interrupted create can drop
+  already-created objects from state (hashicorp/terraform#39283, fixed in
+  1.16.5).
+- `python3` on the machine running `deploy.sh`, which uses it to read plans and
+  state. `clusters-to-rancher.sh` (section 6) additionally needs `curl`, `jq`
+  and `kubectl`.
 - `evroc login`, so `~/.evroc/config.yaml` exists. The provider block here is
   empty (`provider "evroc" {}`) and reads its context -- credentials, and by
   default region/zone/project -- entirely from that file. The CLI is needed for
@@ -69,6 +75,31 @@ every connection at the VIP while every object reports `Ready=True`. Deployments
 from before 0.9.4 worked around it by creating the load balancer with the evroc
 CLI and importing it -- that is gone, along with the CLI dependency and the
 "pass 0" that carried it.
+
+**Preflight.** Before the first apply, `deploy.sh` plans the run (nothing is
+saved outside `.deploy-tmp/`, which it removes on exit) and runs two checks:
+
+- **Orphans.** Every evroc object the apply would create is looked up by name.
+  One that already exists outside this directory's state -- typically left by
+  an interrupted or crashed apply, or a reused `cluster_name` -- stops the run,
+  and `deploy.sh` writes an import block for each to
+  `orphan-imports.tf.proposed`. Review it, rename it to `imports.tf`, check that
+  `terraform plan` shows only imports, re-run `./deploy.sh`, then delete
+  `imports.tf`. Or pick a different `cluster_name` if the objects belong to
+  another deployment.
+- **Free quota.** The cluster's peak vCPU, memory and public-IP demand is
+  compared with what the organization has free (limit - usage, plus whatever
+  this directory already holds). A shortage stops the run before anything is
+  created, instead of at the admission webhook partway through -- possibly in
+  pass 2, after the image build. GPU quota is not exposed to Terraform and is
+  not checked. `--skip-quota-check` bypasses it, e.g. right after a teardown,
+  when evroc may still be counting the deleted VMs for a short while.
+
+Either check that cannot reach a conclusion (a lookup error, a value unknown at
+plan time) says so and gets out of the way. If Terraform itself crashes during
+an apply, `deploy.sh` says so and tells you not to delete state or rely on
+`terraform destroy`; the next run's orphan check finds whatever the crash left
+out of state.
 
 The build happens **once per zone**, because evroc snapshots are zonal and
 cannot be cloned across zones. With the default `zones = ["a", "b", "c"]` that
@@ -136,7 +167,8 @@ keep. `--reclaim-build-disks` revokes it.
 `deploy.sh --rebuild` forces a fresh build on a cluster that already has a
 snapshot in state (an edit under `modules/ai-factory-ha/templates/`, for
 example); it recreates the image-target disks, since a build needs somewhere to
-write. `--yes` passes `-auto-approve` to both passes. `--help` lists all
+write. `--yes` passes `-auto-approve` to both passes. `--skip-quota-check`
+skips the preflight's quota stop (see above). `--help` lists all
 flags; anything else is forwarded verbatim to both `terraform apply` calls,
 except an unrecognised `--flag`, which is a hard error.
 
@@ -333,15 +365,22 @@ cd "$(git rev-parse --show-toplevel)"
 (cd clusters/gpu-a && ./deploy.sh)
 ```
 
-Separate terminals can run them at the same time. vCPU quota, though, is per
-evroc **project**, not per cluster: the management cluster and every downstream
-cluster draw from the same pool, so size each cluster's
-`control_plane_flavor`/`gpu_pools` with the others in mind. `quota_request` and
-`gpu_quota_request` show that one cluster's total, not what the other
-directories have already spent. evroc can also keep counting deleted VMs
-against quota for a while after a teardown, so a deploy straight after
-destroying another cluster can fail on quota that looks free -- wait and
-re-run.
+Separate terminals can run them at the same time. Quota, though, is held at
+the evroc **organization** level, not per cluster: the management cluster and
+every downstream cluster draw from the same pool. A stock cluster peaks at
+16 vCPU (jumphost plus three `c1a.m` control planes, pass 2), so a default
+20 vCPU allowance holds **one** cluster; running a management cluster plus a
+downstream one needs a quota increase first. GPU workers are counted against
+the separate per-model GPU quota instead.
+
+`quota_request` shows this cluster's demand next to the organization's limit
+and current usage, and `deploy.sh`'s preflight stops a cluster that does not
+fit in what is free (see [What each pass does](#3-what-each-pass-does)), so a
+second cluster that would not fit is caught before anything is created.
+`gpu_quota_request` shows GPU demand only; the GPU allowance is not visible to
+Terraform. Deleted VMs can keep counting against usage for a short while after
+a teardown, so a deploy straight after destroying another cluster can be
+refused on quota that is about to be free -- wait a few minutes and re-run.
 
 **4. After pulling repo updates, re-sync.** Module changes need nothing -- every
 copy points at `../../modules/ai-factory-ha`. Changes to the root files here
@@ -465,11 +504,14 @@ cat pass2.auto.tfvars.json   # safe to delete once state is empty; image_ready
 | `not enough quota ... Requested additional N vCPUs` from `virtualmachine-webhook.evroc.com` | A default evroc project allows 20 vCPU. Either `jumphost_flavor` was sized up (it multiplies by the zone count -- three `a1a.l` build hosts are 24 vCPU on their own), or `control_plane_flavor`/`gpu_pools` ask for more than fits alongside the jumphost | The stock defaults budget 12 vCPU in pass 1 and 16 in pass 2; see the quota table in `../../PLATFORM-NOTES.md`. Either restore them, drop to `zones = ["a"]`, or ask evroc to raise the quota -- a GPU pool needs that regardless |
 | `Ready: disk is missing DiskImageRef (ProvisioningFailed)` on a GPU VM | The project still enforces the pre-2026-09-23 rule that a GPU flavor's boot disk must come from an evroc-**provided** image, which requires `spec.source.diskImageRef` -- a snapshot clone has no such field, and every disk this module builds is a snapshot clone. Lifted on 2026-09-23; a project seeing it has not picked the change up | Ask evroc. There is no workaround in the module -- until it is lifted, set `gpu_pools = {}` and re-apply (the failed VM's boot disk is in state and gets destroyed). See `../../PLATFORM-NOTES.md` |
 | `cannot deploy a GPU VM in zone "b". GPU VMs are currently only supported on zone "a"` | evroc runs GPU VMs in **zone a only**, enforced by an admission webhook. A pool left unpinned used to round-robin across every zone, so two thirds of it landed somewhere illegal | Nothing to do on a current checkout: unpinned pools are now placed only in `gpu_zones` (default `["a"]`). If you pinned a pool with `zone = "b"`, the plan now fails and tells you. If evroc widens the rule, widen `gpu_zones` |
-| `not enough quota ... Requested additional 2 "nvidia.com/AD102GL_L40S" GPUs. Only 1 ... (out of 1 in quota)` | GPU quota is counted **per GPU model**, separately from vCPU, and a default project holds one of each | Drop the pool's `count` to what the quota allows, or ask evroc to raise it. No plan-time check exists -- the provider's quota data sources only report object storage. The failed node's boot disk was already created and stays in state; lowering `count` destroys it on the next apply |
+| `not enough quota ... Requested additional 2 "nvidia.com/AD102GL_L40S" GPUs. Only 1 ... (out of 1 in quota)` | GPU quota is counted **per GPU model**, separately from vCPU, and a default project holds one of each | Drop the pool's `count` to what the quota allows, or ask evroc to raise it. No plan-time check exists -- `evroc_organization_quota` reports vCPU, memory and public IPs but not GPUs; compare the `gpu_quota_request` output with your allowance. The failed node's boot disk was already created and stays in state; lowering `count` destroys it on the next apply |
 | Cannot SSH to a node that has no public IP, even from the jumphost | Expected only if the `ssh-jumphost` rule is missing from the node's security group | Nodes accept 22 from `admin_cidrs` *and* from the jumphost's private /32. Hop through the jumphost: `ssh <jumphost>` then `ssh <node_username>@<private ip>` from the `control_plane_private_ips` / `gpu_node_private_ips` outputs |
 | Some nodes of a GPU pool create fine and others fail out of capacity | The pool is spread round-robin across `zones` but the flavor's stock only exists in one of them -- the usual case for GPU profiles | Pin the pool: `gpu_pools = { training = { flavor = ..., zone = "a" } }`. `terraform output node_zones` shows where each node was placed |
 | `terraform plan` proposes replacing every subnet and every node after an edit to `zones` | The list was reordered, not appended to | Subnet CIDRs are assigned by position in `zones`. **Do not approve** unless the replacement is intended -- restore the original order, then append |
 | `terraform plan` fails with "flavor ... is not currently offering" | Typo'd or withdrawn compute profile | The error names the offending flavor and evroc's current list; fix `control_plane_flavor`/`jumphost_flavor`/`gpu_pools[*].flavor`, or set `verify_flavor_availability = false` to skip the check |
+| `deploy.sh` stops with "these objects already exist in the evroc project but are not in this directory's state" | An earlier apply was interrupted or crashed after creating them, the state was deleted, or another deployment uses the same `cluster_name` | Follow the printed steps: review `orphan-imports.tf.proposed`, rename it to `imports.tf`, `terraform plan` (imports only), `./deploy.sh`, then delete `imports.tf`. If they belong to another deployment, change `cluster_name` instead |
+| `deploy.sh` stops with "this cluster does not fit in the organization's free quota" | Another cluster (or leftovers) in the organization already uses the headroom, or VMs deleted a moment ago are still counted | The report shows need, free, limit and usage per resource. Tear down what is not needed, shrink flavors, wait a few minutes after a teardown, or ask evroc for more quota. `--skip-quota-check` if you know it fits |
+| `ERROR: ... Terraform itself crashed` from `deploy.sh` | A Terraform panic -- on 1.16.4, an interrupted create (hashicorp/terraform#39283) | Do not delete state or run `terraform destroy`. Upgrade to 1.16.5+ if the trace mentions `ObjectStatus(0)`, then re-run `./deploy.sh`; its orphan check adopts what the crash left out of state |
 | `terraform plan` fails with "This cluster needs N vCPU / public IPs ... over the organization's quota" | The cluster alone cannot fit the org quota | Smaller `jumphost_flavor`/`control_plane_flavor`, fewer zones or control planes, `control_plane_public_ip`/`gpu_public_ip = false`, or ask evroc for a quota increase |
 | `kubectl` times out against `api_vip:6443` right after pass 2 | Load balancer backend pool not yet healthy | `evroc_lb_backend_pool` populates from the control-plane nodes as they come up; give RKE2 a minute to start listening |
 | Large-packet transfers hang or TLS handshakes stall intermittently | MTU mismatch between `vpc_mtu` and the actual VPC overlay | `cat /etc/cni/net.d/10-canal.conflist` on a node -- wrong value is silent otherwise |
@@ -485,9 +527,10 @@ and never commit it.
 The same values are baked into the elemental image, so **the snapshots are
 credentials too**: each embeds the RKE2 join token and the root password hash,
 so anyone who can clone one has both, independent of anything in Terraform
-state. There is one per zone, plus the image-target disk each was taken from,
-which is kept by default -- so the secrets live in two places per zone, not
-one, for the life of the cluster.
+state. There is one per zone. With `--keep-build-disks`, the image-target disk
+each was taken from is kept too -- so the secrets then live in two places per
+zone, not one, for the life of the cluster. By default `deploy.sh` deletes
+those disks once the snapshots exist.
 Restrict who can read snapshots and disks in the project the same way you would
 restrict `terraform.tfstate` access.
 
