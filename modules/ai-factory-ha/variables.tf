@@ -237,11 +237,6 @@ variable "components" {
     condition     = !contains(var.components, "aif-operator") || contains(var.components, "rancher")
     error_message = "components lists aif-operator without rancher -- the AIF release manifest declares aif-operator -> rancher as a chart dependency."
   }
-
-  validation {
-    condition     = !contains(var.components, "aif-operator") || contains(var.components, "local-path-provisioner") || contains(var.components, "suse-storage")
-    error_message = "components lists aif-operator without a storage chart -- add local-path-provisioner or suse-storage."
-  }
 }
 
 variable "rancher_hostname" {

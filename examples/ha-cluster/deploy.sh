@@ -50,12 +50,19 @@
 # goes back through both passes, and it says so before it does.
 #
 # WHAT TO EXPECT:
+# Before the first apply, a preflight plans the run and stops if an evroc
+# object it would create already exists outside state (typically left by an
+# interrupted or crashed apply; it writes import blocks for those), or if the
+# cluster's peak does not fit in the organization's FREE quota. See
+# check_orphans and check_quota. It costs one extra plan per run.
+#
 # Pass 1 blocks for tens of minutes with NO console output while the
 # jumphost builds the elemental image. This is normal -- watch progress from
 # another terminal with the command this script prints once pass 1 starts.
 #
 # USAGE:
 #   ./deploy.sh [--rebuild] [--reclaim-build-disks|--keep-build-disks] [--yes]
+#               [--skip-quota-check]
 #               [-- | terraform apply args...]
 #
 # Double-dash flags are this script's own and are consumed here; everything
@@ -68,6 +75,7 @@ set -euo pipefail
 usage() {
   cat <<'USAGE'
 Usage: ./deploy.sh [--rebuild] [--reclaim-build-disks|--keep-build-disks] [--yes]
+                   [--skip-quota-check]
                    [terraform apply args...]
 
   --rebuild   Go back through both passes against a cluster that is already
@@ -98,6 +106,10 @@ Usage: ./deploy.sh [--rebuild] [--reclaim-build-disks|--keep-build-disks] [--yes
               pass2.auto.tfvars.json, so a plain ./deploy.sh does not quietly
               delete them. --reclaim-build-disks revokes it.
   --yes       Pass -auto-approve to both terraform apply passes.
+  --skip-quota-check
+              Do not stop when the preflight finds the cluster does not fit in
+              the organization's free quota (e.g. usage still counting VMs
+              deleted a minute ago).
   --help      Show this message.
   --          Stop parsing this script's flags; forward the rest verbatim.
 
@@ -117,6 +129,7 @@ RECLAIM=true
 # KEEP_BUILD_DISKS recovered from pass2.auto.tfvars.json below.
 EXPLICIT_RECLAIM=false
 KEEP_BUILD_DISKS=false
+SKIP_QUOTA_CHECK=false
 TF_ARGS=()
 
 while [[ $# -gt 0 ]]; do
@@ -125,6 +138,7 @@ while [[ $# -gt 0 ]]; do
     --reclaim-build-disks) EXPLICIT_RECLAIM=true; shift ;;
     --keep-build-disks) KEEP_BUILD_DISKS=true; shift ;;
     --yes) TF_ARGS+=(-auto-approve); shift ;;
+    --skip-quota-check) SKIP_QUOTA_CHECK=true; shift ;;
     --help | -h)
       usage
       exit 0
@@ -169,6 +183,25 @@ fi
 # silently is exactly what versions.tf's `~> 0.9.4` comment argues against.
 echo "==> terraform init"
 terraform init -input=false
+
+# Scratch space for this run -- the apply logs and the preflight's saved plan
+# -- in .deploy-tmp/ next to the state, not in $TMPDIR. The saved plan holds
+# every input in plaintext, exactly as terraform.tfstate beside it does, so
+# the directory that already has to be protected is the one place that adds
+# no new exposure; and whatever a hard kill leaves behind sits in plain sight
+# instead of under /var/folders.
+#
+# Removed on ANY exit. bash runs EXIT traps on SIGINT by itself; TERM and HUP
+# are turned into exits so it runs for those too. INT is deliberately not
+# trapped: Terraform handles Ctrl-C itself (graceful stop, state written), and
+# the script must keep running after it to report a crash. Only a SIGKILL
+# leaves the directory behind, and the next run's exit removes it.
+SCRATCH="$PWD/.deploy-tmp"
+mkdir -p "$SCRATCH"
+chmod 700 "$SCRATCH"
+trap 'rm -rf "$SCRATCH"' EXIT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
 
 # A --keep-build-disks asked for on some EARLIER run STAYS asked for, unless
 # --reclaim-build-disks revokes it.
@@ -282,7 +315,7 @@ apply_with_retry() {
   local max_attempts=3
   local log rc
 
-  log=$(mktemp "${TMPDIR:-/tmp}/evroc-apply.XXXXXX")  # -t is not portable
+  log=$(mktemp "$SCRATCH/apply.XXXXXX")  # -t is not portable
   # shellcheck disable=SC2064 # expand $log now, not at trap time
   trap "rm -f '$log'" RETURN
 
@@ -297,6 +330,28 @@ apply_with_retry() {
 
     if [[ $rc -eq 0 ]]; then
       return 0
+    fi
+
+    # A Terraform panic can drop the state of everything created during the
+    # apply, not just the resource it panicked on. Seen on 1.16.4 after one
+    # Ctrl-C (hashicorp/terraform#39283, fixed in 1.16.5): an interrupted create
+    # tripped "has status ObjectStatus(0), which cannot be saved in state", and
+    # the objects that HAD completed never reached terraform.tfstate. A later
+    # `terraform destroy` then reports nothing to destroy while the objects are
+    # still in the project, billed. The next ./deploy.sh finds them, which is
+    # what check_orphans is for, but say so now: this is the moment someone
+    # reaches for `terraform destroy` or deletes the state.
+    if grep -q 'TERRAFORM CRASH' "$log"; then
+      echo >&2
+      echo "ERROR: ${label}: Terraform itself crashed (exit $rc)." >&2
+      echo "       Objects it created during this apply may be missing from terraform.tfstate" >&2
+      echo "       while still existing in the evroc project. Do NOT delete the state or rely" >&2
+      echo "       on 'terraform destroy' now; it can only see what is in state." >&2
+      echo "       Re-run ./deploy.sh: its orphan check lists what exists but is not in state" >&2
+      echo "       and writes import blocks for it. If the stack trace mentions" >&2
+      echo "       'ObjectStatus(0)', upgrade Terraform to 1.16.5 or later first" >&2
+      echo "       (hashicorp/terraform#39283)." >&2
+      return "$rc"
     fi
 
     if ! grep -q 'API error (409)' "$log"; then
@@ -321,6 +376,305 @@ apply_with_retry() {
     attempt=$((attempt + 1))
     sleep 5
   done
+}
+
+# Plan once, then run the checks that need to see the plan before anything is
+# created. Both read the plan and this directory's state; neither writes
+# either. A plan that fails skips them: the apply that follows fails on the
+# same error and shows it better.
+preflight() {
+  local probe a
+  local -a plan_args=()
+  for a in ${TF_ARGS[@]+"${TF_ARGS[@]}"}; do
+    [[ "$a" == -auto-approve ]] || plan_args+=("$a")
+  done
+
+  probe=$(mktemp -d "$SCRATCH/preflight.XXXXXX")
+  # shellcheck disable=SC2064 # expand $probe now, not at trap time
+  trap "rm -rf '$probe'" RETURN
+
+  echo "==> Preflight: planning this apply to check it against the project"
+
+  # The saved plan and its JSON hold every sensitive input in plaintext. They
+  # go with $probe on return, and with $SCRATCH on the checks' exit paths.
+  if ! terraform plan -input=false -refresh=false -out="$probe/plan.bin" \
+      ${plan_args[@]+"${plan_args[@]}"} >"$probe/plan.log" 2>&1 ||
+     ! terraform show -json "$probe/plan.bin" >"$probe/plan.json" 2>>"$probe/plan.log" ||
+     ! terraform providers schema -json >"$probe/schema.json" 2>>"$probe/plan.log"; then
+    echo "    skipped: planning failed (the apply below will show why)."
+    return 0
+  fi
+
+  # Orphans first: they hold quota without being in state, so on a run that
+  # has them the quota check would only report their symptom.
+  check_orphans "$probe"
+  check_quota "$probe"
+}
+
+# Stop before an apply that would CREATE an evroc object whose name already
+# exists in the project: an orphan, i.e. an object Terraform created but that
+# never made it into this directory's state (see the crash note in
+# apply_with_retry; deleted state or reusing a cluster_name get you the same).
+#
+# Why not let the apply find out: a create over an existing name fails with
+# a 409, which apply_with_retry takes for the load balancer's optimistic-
+# concurrency race and retries. And even when the create fails cleanly, the
+# orphan stays outside state, so `terraform destroy` will never remove it.
+#
+# How: plan (no refresh, never saved to this directory), take every evroc
+# create and its planned name, then look each name up with the provider's own
+# data sources from a throwaway root module under .deploy-tmp/, so this
+# directory's state is only read. A 404 means free. Success means an orphan. Any other
+# error makes the check inconclusive, and it gets out of the way rather than
+# block a deploy on a probe failure.
+#
+# Found orphans are written as import blocks (evroc import IDs are the object
+# names) to orphan-imports.tf.proposed. The suffix keeps Terraform from loading
+# it until an operator has reviewed it and renamed it.
+check_orphans() {
+  local probe="$1" found
+
+  echo "==> Orphan check: does anything this apply would create already exist in the project?"
+
+  # Every line of every data block is mapped to its lookup, so a diagnostic's
+  # line number names the lookup it belongs to. Only types that have a data source, and only project/region
+  # arguments that data source accepts.
+  mkdir "$probe/root"
+  if ! python3 - "$probe" <<'PY'
+import json, sys
+d = sys.argv[1]
+plan = json.load(open(d + "/plan.json"))
+schema = json.load(open(d + "/schema.json"))
+ds = {}
+for src, p in schema.get("provider_schemas", {}).items():
+    if src.endswith("/evroc"):
+        ds = {k: v["block"].get("attributes", {})
+              for k, v in p.get("data_source_schemas", {}).items()}
+# One list entry per file line: the diagnostics map back by line number.
+lines = ['terraform {',
+         '  required_providers {',
+         '    evroc = { source = "evroc-oss/evroc" }',
+         '  }',
+         '}',
+         'provider "evroc" {}']
+rows = {}
+for rc in plan.get("resource_changes", []):
+    change = rc.get("change") or {}
+    after = change.get("after") or {}
+    t = rc.get("type", "")
+    if rc.get("mode") != "managed" or t not in ds or change.get("actions") != ["create"] \
+            or not isinstance(after.get("name"), str):
+        continue
+    args = ["name = %s" % json.dumps(after["name"])]
+    for k in ("project", "region"):
+        if k in ds[t] and isinstance(after.get(k), str):
+            args.append("%s = %s" % (k, json.dumps(after[k])))
+    # HCL allows only one argument in a one-line block, so each lookup spans
+    # several lines, and every one of them maps back to it.
+    n = len(set(r[0] for r in rows.values()))
+    for text in ['data "%s" "p%d" {' % (t, n)] + ["  " + a for a in args] + ["}"]:
+        lines.append(text)
+        rows[len(lines)] = [rc["address"], after["name"]]
+open(d + "/root/main.tf", "w").write("\n".join(lines) + "\n")
+json.dump(rows, open(d + "/rows.json", "w"))
+PY
+  then
+    echo "    skipped: could not read the plan."
+    return 0
+  fi
+
+  if [[ "$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))))' "$probe/rows.json")" == 0 ]]; then
+    echo "    nothing to create."
+    return 0
+  fi
+
+  # The provider already installed here, pinned by the same lock file: no
+  # download, and the lookups run the exact provider the apply will.
+  cp .terraform.lock.hcl "$probe/root/"
+  if ! terraform -chdir="$probe/root" init -input=false -plugin-dir="$PWD/.terraform/providers" \
+      >>"$probe/plan.log" 2>&1; then
+    echo "    skipped: could not initialise the lookup module."
+    return 0
+  fi
+  # Fails whenever any lookup 404s, i.e. almost always. The diagnostics are the
+  # result, so the exit code is not.
+  terraform -chdir="$probe/root" plan -input=false -json >"$probe/lookup.json" 2>>"$probe/plan.log" || true
+
+  # Prints the orphans as "address<TAB>name", writes their import blocks, and
+  # exits 3 if some lookup failed for a reason other than 404.
+  found=$(python3 - "$probe" <<'PY'
+import json, sys
+d = sys.argv[1]
+rows = {int(k): v for k, v in json.load(open(d + "/rows.json")).items()}
+missing, unsure = set(), False
+for raw in open(d + "/lookup.json"):
+    try:
+        msg = json.loads(raw)
+    except ValueError:
+        continue
+    diag = msg.get("diagnostic") if msg.get("type") == "diagnostic" else None
+    if not diag or diag.get("severity") != "error":
+        continue
+    line = ((diag.get("range") or {}).get("start") or {}).get("line")
+    text = "%s %s" % (diag.get("summary", ""), diag.get("detail", ""))
+    if line in rows and "API error (404)" in text:
+        missing.add(line)
+    else:
+        unsure = True
+if unsure:
+    sys.exit(3)
+# Rows repeat once per line of their block; keep each lookup once, in order.
+missing = set(rows[l][0] for l in missing)
+orphans, seen = [], set()
+for l in sorted(rows):
+    addr = rows[l][0]
+    if addr not in missing and addr not in seen:
+        seen.add(addr)
+        orphans.append(rows[l])
+if orphans:
+    with open("orphan-imports.tf.proposed", "w") as f:
+        f.write("# Written by deploy.sh's orphan check. Review, then rename to imports.tf,\n"
+                "# re-run ./deploy.sh, and delete imports.tf once the apply succeeds.\n")
+        for addr, name in orphans:
+            f.write('\nimport {\n  to = %s\n  id = %s\n}\n' % (addr, json.dumps(name)))
+for addr, name in orphans:
+    print("%s\t%s" % (addr, name))
+PY
+  ) || {
+    echo "    skipped: some lookups failed for a reason other than 'not found'."
+    return 0
+  }
+
+  if [[ -z "$found" ]]; then
+    echo "    none."
+    return 0
+  fi
+
+  echo >&2
+  echo "ERROR: these objects already exist in the evroc project but are not in this" >&2
+  echo "       directory's state; the apply would try to create them again:" >&2
+  printf '%s\n' "$found" | awk -F'\t' '{ printf "         %-60s %s\n", $1, $2 }' >&2
+  echo >&2
+  echo "       Most likely left behind by an interrupted or crashed apply. To adopt them:" >&2
+  echo "         1. review orphan-imports.tf.proposed (just written, one import block each)" >&2
+  echo "         2. mv orphan-imports.tf.proposed imports.tf" >&2
+  echo "         3. terraform plan    (expect 'N to import'; stop if any show as destroy)" >&2
+  echo "         4. ./deploy.sh, then delete imports.tf once it succeeds" >&2
+  echo "       Or, if they belong to some other deployment, pick a different cluster_name." >&2
+  exit 1
+}
+
+# Stop before an apply whose cluster cannot fit in what the organization has
+# FREE. The module's own quota_check compares the cluster alone with the limit
+# and deliberately ignores usage (see availability.tf), so a second cluster in
+# an org that already runs one passes the plan and then dies at the admission
+# webhook, possibly in pass 2, after the whole image build.
+#
+# Usage counts this cluster's own objects too, which is why the module cannot
+# use it. This can: the plan's prior state says exactly which public IPs and
+# VMs this directory already holds, and the plan's compute-profile lookup
+# gives each VM's vCPU and memory. So headroom = limit - usage + own, compared
+# with the cluster's peak demand (the quota_request output). GPU workers are
+# excluded, as in the module: they are not drawn from this quota, and the GPU
+# quota is not exposed to Terraform at all.
+#
+# Only a shortage stops the run. Anything the check cannot work out (no
+# quota_request output, an unknown flavor) skips that part with a note.
+# Recently deleted VMs can keep counting against usage for a while
+# (PLATFORM-NOTES.md), so a shortage right after a teardown may clear by
+# itself; --skip-quota-check exists for when you know better.
+check_quota() {
+  local probe="$1" report rc=0
+
+  if [[ "$SKIP_QUOTA_CHECK" == true ]]; then
+    echo "==> Quota check: skipped (--skip-quota-check)"
+    return 0
+  fi
+  echo "==> Quota check: does this cluster's peak fit in what the organization has free?"
+
+  # Exit 0: fits. 1: shortage. 3: could not tell (reason on stdout).
+  report=$(python3 - "$probe" <<'PY'
+import json, re, sys
+plan = json.load(open(sys.argv[1] + "/plan.json"))
+q = ((plan.get("output_changes") or {}).get("quota_request") or {}).get("after")
+if not isinstance(q, dict) or not all(isinstance(q.get(k), dict) for k in ("demand", "limit", "usage")):
+    print("no plan-time quota_request output.")
+    sys.exit(3)
+demand, limit, usage = q["demand"], q["limit"], q["usage"]
+
+def walk(mod):
+    for r in mod.get("resources") or []:
+        yield r
+    for c in mod.get("child_modules") or []:
+        for r in walk(c):
+            yield r
+prior = list(walk((((plan.get("prior_state") or {}).get("values")) or {}).get("root_module") or {}))
+managed = [r for r in prior if r.get("mode") == "managed"]
+
+GB = {"KB": 1e-6, "MB": 1e-3, "GB": 1.0, "TB": 1e3}
+def gb(v):
+    m = re.match(r"^\s*([0-9.]+)\s*([A-Za-z]+)\s*$", str(v))
+    return float(m.group(1)) * GB[m.group(2).upper()] if m and m.group(2).upper() in GB else None
+
+profiles = {}
+for r in prior:
+    if r.get("mode") == "data" and r.get("type") == "evroc_compute_profiles":
+        for p in (r.get("values") or {}).get("details") or []:
+            profiles[p.get("name")] = p
+own_vcpus, own_mem, unknown = 0, 0.0, []
+for r in managed:
+    if r.get("type") == "evroc_virtual_machine" and r.get("name") != "gpu":
+        f = (r.get("values") or {}).get("flavor")
+        p = profiles.get(f)
+        if p is None:
+            unknown.append(str(f))
+            continue
+        own_vcpus += p.get("vcpus") or 0
+        m = gb("%s%s" % (p.get("memory_amount"), p.get("memory_unit")))
+        own_mem = None if m is None or own_mem is None else own_mem + m
+own_ips = sum(1 for r in managed if r.get("type") == "evroc_public_ip")
+
+rows = [("public IPs", demand.get("public_ips"), limit.get("public_ips"), usage.get("public_ips"), own_ips, "")]
+if unknown:
+    print("    vCPU/memory not checked: no compute profile for flavor(s) %s" % ", ".join(sorted(set(unknown))))
+else:
+    rows.append(("vCPUs", demand.get("vcpus"), limit.get("vcpus"), usage.get("vcpus"), own_vcpus, ""))
+    rows.append(("memory", demand.get("memory_gb"), gb(limit.get("memory")), gb(usage.get("memory")), own_mem, " GB"))
+
+short = False
+for what, need, lim, used, own, unit in rows:
+    if None in (need, lim, used, own):
+        print("    %-10s not checked: value not known at plan time" % what)
+        continue
+    free = lim - used + own
+    ok = need <= free
+    short = short or not ok
+    fmt = lambda x: ("%g" % round(x, 1)) + unit
+    print("    %-10s %s  needs %s, free %s  (limit %s, in use %s, %s of it this cluster's)"
+          % (what, "ok   " if ok else "SHORT", fmt(need), fmt(free), fmt(lim), fmt(used), fmt(own)))
+sys.exit(1 if short else 0)
+PY
+  ) || rc=$?
+
+  case "$rc" in
+    0)
+      printf '%s\n' "$report"
+      ;;
+    1)
+      printf '%s\n' "$report" >&2
+      echo >&2
+      echo "ERROR: this cluster does not fit in the organization's free quota; the apply" >&2
+      echo "       would fail at evroc's admission webhook partway through (possibly in" >&2
+      echo "       pass 2, after the image build). Free capacity by tearing something down," >&2
+      echo "       use smaller flavors or control_plane_count, or ask evroc for more quota." >&2
+      echo "       Just deleted something? evroc can keep counting it for a while; retry in" >&2
+      echo "       a few minutes, or pass --skip-quota-check if you are sure it will fit." >&2
+      exit 1
+      ;;
+    *)
+      echo "    skipped: ${report:-could not evaluate the quota}"
+      ;;
+  esac
 }
 
 # Reads this directory's last-applied state directly -- no plan, no refresh,
@@ -360,6 +714,7 @@ if [[ -n "$EXISTING_SNAPSHOT_IDS" && "$REBUILD" == false ]]; then
     PIN_RECLAIM=true
   fi
   pin_image_ready
+  preflight
   apply_with_retry "Apply"
   echo "==> Done. See outputs for jumphost_public_ipv4, kubernetes_api_endpoint, api_vip and rancher_url."
   exit 0
@@ -379,6 +734,8 @@ echo "==> Resetting pass2.auto.tfvars.json before pass 1 (see the comment above 
 cat > pass2.auto.tfvars.json <<'EOF'
 {}
 EOF
+
+preflight
 
 # No nodes in pass 1, deliberately: control-plane and GPU VMs are gated on
 # local.snapshot_expected, which is false until image_ready flips. Saying

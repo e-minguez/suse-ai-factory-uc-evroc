@@ -65,7 +65,10 @@ evroc login                     # writes ~/.evroc/config.yaml
 with no output; watch it with
 `ssh suse@<jumphost-ip> tail -f /var/log/elemental-factory.log`. The example
 README covers timing, the post-deploy checks, and what `terraform destroy`
-leaves behind.
+leaves behind. It also covers running a management cluster alongside one or
+more downstream GPU clusters and registering the latter into the former's
+Rancher with `clusters-to-rancher.sh` -- see
+[`examples/ha-cluster/README.md#6-management--downstream-clusters`](examples/ha-cluster/README.md#6-management--downstream-clusters).
 
 The provider reads `~/.evroc/config.yaml`, so `provider "evroc" {}` needs no
 arguments. `region` and `project` are module variables that default to whatever
@@ -126,6 +129,12 @@ peak vCPU, memory or public-IP demand exceeds the organization quota
 `control_plane_public_ip = true` against 3 IPs -- and the `quota_request`
 output prints demand, limit and current usage. It needs API reachability at
 plan time; set `verify_flavor_availability = false` to skip it.
+
+`deploy.sh` adds a preflight on top: it stops when the cluster does not fit in
+what the organization has *free* (limit minus usage, e.g. with another cluster
+already running), and when an object the apply would create already exists
+outside state -- left by an interrupted or crashed apply -- in which case it
+writes import blocks to adopt it. See the example README.
 
 ## Security
 

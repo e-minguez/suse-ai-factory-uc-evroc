@@ -131,8 +131,8 @@ packing tightly within each of three zones is not what it asks for.
 
 #### The image is built once per zone, not once
 
-`evroc_snapshot` looks regional -- its schema has `region` and no `zone` -- but
-it is not. It inherits the zone of the disk in its `disk_ref`, and
+`evroc_snapshot` is zonal: its schema has `region` and no `zone`, and it
+inherits the zone of the disk in its `disk_ref`.
 `disk-webhook.evroc.com` rejects a disk created from another zone's snapshot:
 
 ```
@@ -386,7 +386,7 @@ extension(s) not found".
 ## Outputs
 
 `jumphost_public_ipv4`, `jumphost_ssh_login`, `api_vip`, `api_host`,
-`kubernetes_api_endpoint`, `ingress_endpoint`, `rancher_hostname`,
+`kubernetes_api_endpoint`, `ingress_endpoint`, `cluster_name`, `rancher_hostname`,
 `rancher_url`, `rancher_bootstrap_password` (sensitive), `rke2_token`
 (sensitive), `snapshot_ids`, `image_target_disk_names`, `builder_private_ips`,
 `build_status_url`,

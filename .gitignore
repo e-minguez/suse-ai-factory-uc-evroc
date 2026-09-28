@@ -31,6 +31,10 @@
 *.tfplan
 *.tfplan.*
 
+# deploy.sh's per-run scratch: apply logs and the preflight's saved plan.
+# Removed on exit, but a SIGKILL leaves it -- with that plan in it.
+.deploy-tmp/
+
 # Provider credentials and local CLI config.
 .terraformrc
 terraform.rc
@@ -74,6 +78,12 @@ crash.*.log
 # providers, so the module's lock file is noise. Examples are root
 # modules; their lock file is committed for reproducible applies.
 modules/**/.terraform.lock.hcl
+
+# Per-deployment copies of examples/ha-cluster (see its README, "Deploying
+# multiple clusters"). Local working roots, not source: committing them only
+# adds drifting duplicates of the example. The secret/state patterns above
+# already cover their tfvars and state; this keeps out the copied code too.
+/clusters/
 
 # Editor, tooling and OS noise.
 .claude/

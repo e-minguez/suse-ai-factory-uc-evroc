@@ -28,6 +28,11 @@ output "ingress_endpoint" {
   value       = var.ingress_controller == "none" ? null : "https://${local.api_vip}"
 }
 
+output "cluster_name" {
+  description = "var.cluster_name -- the prefix baked into every node hostname (\"<cluster_name>-cp-NN\", \"<cluster_name>-<pool>-NN\"). Also read by clusters-to-rancher.sh from this module's tfstate as the default name under which to register the cluster in Rancher, on both sides of that operation: the management cluster's own name if it is ever registered into a higher Rancher, and a downstream cluster's default display name when --cluster-name is not given explicitly."
+  value       = var.cluster_name
+}
+
 output "rancher_hostname" {
   description = "Hostname Rancher's ingress is configured for -- var.rancher_hostname if set, otherwise rancher-<api_vip>.sslip.io. null when \"rancher\" is not in var.components -- nothing serves this hostname then."
   value       = contains(local.enabled_components, "rancher") ? local.rancher_hostname : null
